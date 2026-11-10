@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "silo"
+version = "0.1.0"
+description = "Defense-in-depth containment for local LLMs: no egress, no escape."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []  # stdlib only, on purpose: the containment tool must not widen the supply chain
+
+[project.scripts]
+silo = "silo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+silo = ["probes/*.py"]

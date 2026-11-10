@@ -1,0 +1,55 @@
+# silo configuration. Copy to ./silo.toml or ~/.config/silo/silo.toml.
+# Unknown keys and wrong types are errors. Everything except [model] has a default.
+
+[silo]
+# Names the container (silo-<name>), the socket directory, the manifest and the audit log.
+name = "default"
+
+[model]
+# A directory that holds ONLY model files. It is bind-mounted read-only into the sandbox and
+# relabelled for SELinux (container_file_t), so never point this at a home directory.
+dir = "~/models/my-model"
+# Path of the GGUF inside that directory. For split files, the first shard.
+file = "my-model-Q4_K_M.gguf"
+ctx_size = 4096
+# threads = 8
+# Extra llama-server flags. Anything that opens a listener, downloads, or enables tools/agents/MCP
+# is refused (see FORBIDDEN_SERVER_WORDS in src/silo/runtime.py).
+extra_args = []
+
+[runtime]
+# Pin both images by digest: run `silo pull` and paste what it prints. silo never pulls at launch.
+image = "ghcr.io/ggml-org/llama.cpp:server"
+probe_image = "docker.io/library/python:3.13-slim"
+# Hard memory cap for the sandbox (no swap on top). Must fit the model plus context.
+memory = "8g"
+# cpus = 6.0
+pids_limit = 256
+# "errno": denied syscalls return an error.  "kill": the first denied syscall terminates the
+# runtime. Use "kill" once your model runs cleanly; it turns probing into a crash you will notice.
+seccomp_action = "errno"
+# "none" | "nvidia" | "amd" | "dri". Anything but "none" exposes a GPU driver to the sandbox and
+# keeps memfd_create allowed. Not yet verified on real hardware.
+gpu = "none"
+# seccomp_base = "/usr/share/containers/seccomp.json"
+startup_timeout = 600.0
+
+[gateway]
+listen = "127.0.0.1"
+port = 8088
+# "off": no scanning (the protocol is still sanitised).  "monitor": log and alert.
+# "enforce": withhold completions with high-severity findings; streams are delivered only once
+# they have finished clean.
+scanner = "monitor"
+# false: requests that carry tools/functions are refused and tool calls from the model are cut off.
+# true: whatever executes those tool calls is outside the silo and becomes your boundary.
+allow_tools = false
+# Write prompts and completions into the audit log. Off by default: hashes and findings only.
+log_content = false
+max_request_bytes = 1048576
+max_response_bytes = 16777216
+# Total seconds per request, from connect to last byte.
+timeout = 600.0
+max_concurrency = 4
+# Required for a non-loopback listen address: name of an environment variable holding a bearer token.
+# api_key_env = "SILO_API_KEY"

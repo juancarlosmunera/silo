@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+# local configuration and anything that could contain model paths or keys
+silo.toml
+*.gguf
+*.safetensors
+models/
