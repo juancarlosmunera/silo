@@ -1,0 +1,167 @@
+#!/bin/sh
+# silo-vm: a local virtual machine with no network device, as a second kernel around silo.
+#
+# The model's runtime can only attack the guest's kernel. Getting from there to your machine means
+# breaking out of KVM/QEMU, and the guest has nothing to send packets with: no network device is
+# attached, so there is nothing to firewall. The one channel is a VM socket (AF_VSOCK) that
+# carries SSH, opened from the host side.
+#
+#   silo-vm create IMAGE.qcow2   new VM from a Fedora Cloud image (verify its signature first)
+#   silo-vm update               boot WITH a network device, to update the guest; see docs/LOCAL_VM.md
+#   silo-vm start                boot with NO network device (normal operation)
+#   silo-vm stop                 shut the guest down
+#   silo-vm status               what is running, and whether it has a network device
+#   silo-vm ssh-config           print the ssh client configuration for reaching it
+#
+# Needs: qemu-system-x86_64, qemu-img, /dev/kvm, /dev/vhost-vsock, a systemd user session,
+# OpenSSH with systemd-ssh-proxy (systemd 256 or newer), and genisoimage, mkisofs or xorriso.
+set -eu
+
+DIR=${SILO_VM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/silo-vm}
+CID=${SILO_VM_CID:-42}
+MEMORY=${SILO_VM_MEMORY:-4096}
+CPUS=${SILO_VM_CPUS:-4}
+DISK=${SILO_VM_DISK:-40G}
+UNIT=${SILO_VM_UNIT:-silo-vm}
+PROXY=/usr/lib/systemd/systemd-ssh-proxy
+
+die() { echo "silo-vm: $*" >&2; exit 1; }
+running() { [ "$(systemctl --user is-active "$UNIT" 2>/dev/null)" = active ]; }
+need() { [ -e "$DIR/disk.qcow2" ] || die "no VM in $DIR; run: silo-vm create IMAGE.qcow2"; }
+
+# Every boot uses these options. What they leave out matters as much as what they add:
+#   -nodefaults -no-user-config   no default NIC, display, USB, floppy, CD-ROM or parallel port
+#   -sandbox on,...               QEMU's own seccomp filter: no fork/exec, no privilege changes
+#   vhost-vsock-pci               the host/guest channel; handled in the host kernel, not in QEMU
+# Anything passed to boot() is added on top (the network device, in `update` only).
+boot() {
+    [ -r /dev/kvm ] && [ -w /dev/kvm ] || die "/dev/kvm is not usable by this account"
+    [ -r /dev/vhost-vsock ] && [ -w /dev/vhost-vsock ] || die "/dev/vhost-vsock is not usable by this account"
+    running && die "already running (silo-vm stop)"
+    : > "$DIR/console.log"
+    systemd-run --user --quiet --collect --unit="$UNIT" --working-directory="$DIR" \
+        qemu-system-x86_64 -name "$UNIT" -machine q35,accel=kvm -cpu host -smp "$CPUS" -m "$MEMORY" \
+        -nodefaults -no-user-config -display none \
+        -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+        -drive file=disk.qcow2,if=virtio,format=qcow2 \
+        -drive file=seed.iso,if=virtio,format=raw,readonly=on \
+        -device vhost-vsock-pci,guest-cid="$CID" \
+        -serial file:console.log "$@"
+}
+
+ssh_config() {
+    cat <<CONF
+# silo-vm: reached over a VM socket, not over a network.
+#   ssh -F $DIR/ssh_config silo-vm            the unprivileged account that runs the model
+#   ssh -F $DIR/ssh_config silo-vm-admin      the account with sudo
+# or add to ~/.ssh/config:   Include $DIR/ssh_config
+Host silo-vm silo-vm-admin
+    ProxyCommand $PROXY vsock/$CID 22
+    ProxyUseFdpass yes
+    IdentityFile $DIR/key
+    IdentitiesOnly yes
+    IdentityAgent none
+    ForwardAgent no
+    UserKnownHostsFile $DIR/known_hosts
+    StrictHostKeyChecking accept-new
+    CheckHostIP no
+Host silo-vm
+    User silo
+Host silo-vm-admin
+    User admin
+CONF
+}
+
+case "${1:-}" in
+create)
+    [ $# -eq 2 ] || die "usage: silo-vm create IMAGE.qcow2"
+    [ -f "$2" ] || die "no such image: $2"
+    image=$(realpath "$2")
+    [ -e "$DIR/disk.qcow2" ] && die "a VM already exists in $DIR"
+    [ -x "$PROXY" ] || die "$PROXY not found (needs systemd 256 or newer)"
+    mkiso=""
+    for tool in genisoimage mkisofs xorrisofs; do command -v "$tool" >/dev/null 2>&1 && { mkiso=$tool; break; }; done
+    [ -n "$mkiso" ] || die "need genisoimage, mkisofs or xorrisofs to build the cloud-init seed"
+    mkdir -p "$DIR" && chmod 700 "$DIR" && cd "$DIR"
+    ssh-keygen -q -t ed25519 -N "" -C silo-vm -f key
+    pub=$(cat key.pub)
+    # First boot: update everything, create the two accounts, then power off. The update needs the
+    # network device that only `silo-vm update` attaches.
+    cat > user-data <<SEED
+#cloud-config
+hostname: silo-vm
+users:
+  - name: admin
+    groups: wheel
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - $pub
+  - name: silo
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - $pub
+ssh_pwauth: false
+package_update: true
+package_upgrade: true
+packages:
+  - podman
+  - nftables
+  - rsync
+runcmd:
+  - [loginctl, enable-linger, silo]
+power_state:
+  mode: poweroff
+  message: silo-vm first boot complete
+  condition: true
+SEED
+    printf 'instance-id: silo-vm-%s\nlocal-hostname: silo-vm\n' "$(date +%s)" > meta-data
+    "$mkiso" -quiet -output seed.iso -volid cidata -joliet -rock user-data meta-data
+    qemu-img create -q -f qcow2 -F qcow2 -b "$image" disk.qcow2 "$DISK"
+    ssh_config > ssh_config
+    echo "created $DIR"
+    echo "next: silo-vm update   (first boot, with a network device: updates the guest and powers off)"
+    ;;
+update)
+    need
+    boot -netdev user,id=n0 -device virtio-net-pci,netdev=n0
+    echo "running WITH a network device (outbound only; nothing on the host listens for it)."
+    echo "first boot: the guest updates itself and powers off; watch with: silo-vm status"
+    echo "later updates: ssh -F $DIR/ssh_config silo-vm-admin 'sudo dnf -y upgrade && sudo poweroff'"
+    ;;
+start)
+    need
+    boot
+    echo "running with no network device. ssh -F $DIR/ssh_config silo-vm"
+    ;;
+stop)
+    running || { echo "not running"; exit 0; }
+    # Ask the guest to shut down cleanly; cut the power only if it does not.
+    ssh -F "$DIR/ssh_config" -o ConnectTimeout=5 -o BatchMode=yes silo-vm-admin sudo poweroff >/dev/null 2>&1 || true
+    i=0; while running && [ $i -lt 60 ]; do sleep 1; i=$((i + 1)); done
+    running && systemctl --user stop "$UNIT"
+    echo "stopped"
+    ;;
+status)
+    need
+    if running; then
+        pid=$(systemctl --user show "$UNIT" -p MainPID --value)
+        if tr '\0' '\n' < "/proc/$pid/cmdline" | grep -q '^virtio-net-pci'; then
+            echo "running WITH a network device (update mode)"
+        else
+            echo "running with no network device"
+        fi
+    else
+        echo "not running"
+    fi
+    ;;
+ssh-config)
+    ssh_config
+    ;;
+*)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+    ;;
+esac

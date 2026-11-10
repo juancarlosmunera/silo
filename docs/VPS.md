@@ -300,3 +300,9 @@ a way around the others. If you have the choice, use Fedora.
 
 Debian and the RHEL family have not been tested. On any distribution, `silo doctor` and
 `silo probe` tell you what you actually have.
+
+## The same thing at home
+
+The setup in this guide also works against a virtual machine on your own computer, which can be
+stricter than any rented server: [LOCAL_VM.md](LOCAL_VM.md) runs it in a VM that has no network
+device at all.

@@ -146,9 +146,10 @@ Stated plainly, in rough order of importance.
    `mmap`, `execve` and the socket calls for `AF_UNIX`. A bug behind any of them is a way out, and
    SELinux and the user namespace are then the only things left. Use `seccomp_action = "kill"` so a
    probing exploit dies on its first denied call, keep the kernel patched, and apply the host
-   sysctls. The real fix is a second kernel boundary (gVisor or a microVM), which silo does not
-   have yet. Until it does, put the boundary around the machine: `docs/VPS.md` describes a
-   dedicated server that holds nothing and cannot start a connection.
+   sysctls. The real fix is a second boundary around the kernel. silo offers two, both outside the
+   sandbox itself: a local VM with no network device (`docs/LOCAL_VM.md`), and a dedicated server
+   that holds nothing and cannot start a connection (`docs/VPS.md`). Without one of them, the
+   host kernel is the only thing between a compromised runtime and your account.
 2. **The person reading the output.** A contained model can still write "run this". The tripwire
    recognises common shapes and can be evaded by any model capable enough to matter. Treat output
    as untrusted input, especially commands.
@@ -188,7 +189,7 @@ Stated plainly, in rough order of importance.
 
 ## Roadmap
 
-- gVisor (`runsc`) and libkrun microVM backends, for a kernel boundary that is not the host's.
+- gVisor (`runsc`) as the sandbox runtime: a second kernel boundary without a whole VM.
 - Mandatory access control for the sandbox on AppArmor hosts.
 - Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.

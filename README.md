@@ -28,7 +28,8 @@ the gateway exists to narrow and record it.
 **Contents:** [Isn't a container enough?](#isnt-a-container-enough) ·
 [How it works](#how-it-works) · [Check it yourself](#check-it-yourself) ·
 [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start) ·
-[On a VPS](#on-a-vps) · [Commands](#commands) · [Configuration](#configuration) ·
+[On a VPS](#on-a-vps) · [In a local VM](#in-a-local-vm) · [Commands](#commands) ·
+[Configuration](#configuration) ·
 [The gateway](#the-gateway) ·
 [Tightening it further](#tightening-it-further) · [Limits](#limits) · [Roadmap](#roadmap) ·
 [Development](#development) · [Security](#security) · [License](#license)
@@ -218,6 +219,23 @@ a dedicated unprivileged account, images and model pushed over SSH so the server
 access, firewall rules that seal the host, a systemd service, and an SSH tunnel to the gateway.
 `silo doctor --sealed` then proves from the machine itself that nothing gets out.
 
+## In a local VM
+
+On your own computer the equivalent boundary is a virtual machine. `bin/silo-vm` creates one from
+a Fedora Cloud image and runs it with **no network device at all**: the only channel is a VM
+socket that carries SSH, opened from your side. silo runs inside it as on a server, and a kernel
+exploit inside the sandbox then lands in a guest that has nothing to send packets with and holds
+nothing of yours.
+
+```sh
+bin/silo-vm create Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
+bin/silo-vm update      # first boot only: updates the guest, then powers off
+bin/silo-vm start       # from now on: no network device
+```
+
+It needs KVM and costs the guest's memory. In a quick test, inference in the VM was as fast as on
+the host. [docs/LOCAL_VM.md](docs/LOCAL_VM.md) has the walkthrough, tested from a fresh VM.
+
 ## Commands
 
 | Command | What it does |
@@ -303,9 +321,9 @@ The defaults favour getting a model running. Once yours runs cleanly:
 Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The short version:
 
 - **The kernel is shared.** A kernel vulnerability reachable through the roughly 320 syscalls still
-  allowed is the main way out. silo shrinks that surface; it does not remove it. Until silo has a
-  second kernel boundary of its own, add one from outside: run it on a dedicated, sealed VPS
-  ([docs/VPS.md](docs/VPS.md)), or inside a VM with no network adapter.
+  allowed is the main way out of the sandbox. silo shrinks that surface; it does not remove it.
+  Put a second boundary around it: a VM with no network device on your own machine
+  ([docs/LOCAL_VM.md](docs/LOCAL_VM.md)), or a dedicated, sealed server ([docs/VPS.md](docs/VPS.md)).
 - **The answer still reaches you.** A model with no network can ask you to run something. The
   tripwire catches obvious shapes and is a regex, not a boundary. Treat output as untrusted input.
 - **Your client is outside the silo.** If it renders HTML, fetches images or executes tool calls,
@@ -317,7 +335,7 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 
 ## Roadmap
 
-- A second kernel boundary: gVisor or a microVM as the sandbox backend.
+- A lighter second kernel boundary than a full VM: gVisor as the sandbox runtime.
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
 - Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
@@ -346,10 +364,12 @@ src/silo/probes/        the escape-probe suite that runs inside the sandbox
 src/silo/doctor.py      host and configuration checks
 src/silo/hostrules.py   host firewall rule generation
 bin/silo                runs silo from a checkout, ignoring the current directory
+bin/silo-vm             creates and runs a local VM with no network device
 host/                   optional root-level hardening: firewall rules, sysctls
 examples/               annotated configuration, systemd unit
 docs/THREAT_MODEL.md    assumptions, controls, residual risk
 docs/VPS.md             deploying on a rented server, step by step
+docs/LOCAL_VM.md        a second kernel on your own machine: silo inside a VM
 ```
 
 ## Security
