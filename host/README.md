@@ -4,8 +4,9 @@ Everything silo does on its own runs as your user, with no root and no changes o
 state directories. The two pieces here are different: they need root, they are host-wide, and they
 are optional. They are the layers that still stand if something gets out of the container.
 
-Neither has been applied on the machine silo was developed on (that takes root). The firewall rule
-below was checked for syntax and loadability inside a throwaway user+network namespace only.
+Both were applied and exercised as root on Fedora 43 and Ubuntu 24.04 test machines; the results
+are in [docs/VPS.md](../docs/VPS.md), which is also the place to start if the machine is a rented
+server. They have not been applied on the workstation silo is developed on.
 
 ## 1. No network for the sandbox UID, enforced by the host
 
@@ -24,8 +25,32 @@ rootless containers are not affected unless they also run as container UID 65534
 networking. A sandbox behaving normally never reaches this hook, so a counter above zero means
 something left its network namespace and tried to talk.
 
-The table lives until reboot. To make it permanent, save the output of `silo nft` as
-`/etc/nftables/silo.nft` and load it at boot, for example with a oneshot unit:
+Tested: with the rule loaded, a process running as that UID gets `Operation not permitted` on UDP
+and no answer on TCP, loopback included, while every other account is unaffected.
+
+### A sealed host
+
+On a machine dedicated to the model, `silo nft --sealed` goes further: the whole machine sends
+nothing except replies from its SSH server, DHCP and IPv6 neighbour discovery. Nothing on it can
+start a connection, and a process that listens on some port cannot be reached from outside,
+because its replies never leave.
+
+```sh
+silo nft --sealed --ssh-port 22 | sudo install -m 0600 /dev/stdin /etc/nftables/silo.nft
+sudo cat /etc/nftables/silo.nft          # read it; check the SSH port it names
+sudo nft -f /etc/nftables/silo.nft
+```
+
+It names the port your SSH server listens on, and loading it with the wrong port cuts you off.
+Open a second SSH connection to confirm you still get in before making it permanent; until then a
+reboot removes it. Package updates, DNS and time synchronisation stop while it is loaded, so
+maintenance means `sudo nft delete table inet silo` for the duration. `silo doctor --sealed`
+confirms from the machine itself that nothing gets out.
+
+### Making it permanent
+
+Either ruleset lives until reboot. To load it at boot, save it as `/etc/nftables/silo.nft` and add
+a oneshot unit:
 
 ```ini
 # /etc/systemd/system/silo-nft.service

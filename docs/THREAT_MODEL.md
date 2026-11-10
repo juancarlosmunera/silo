@@ -31,8 +31,9 @@ What has to be correct for the above to hold:
 - silo's launcher and gateway: about 1,400 lines of Python (`sandbox.py`, `seccomp.py`, `runtime.py`,
   `gateway.py`), standard library only;
 - the base seccomp profile shipped by the distribution, which silo tightens but does not replace;
-- `silo.toml`, which chooses the image, the model directory and the seccomp base. silo prints which
-  file it used whenever it launches something.
+- `silo.toml`, which chooses the image, the model directory and the seccomp base. It is read only
+  from an explicit path or the user's configuration directory, never from the current directory,
+  and silo prints which file it used whenever it launches something.
 
 Not trusted: the model files, the container image, everything the runtime says on its socket,
 and clients of the gateway.
@@ -47,7 +48,7 @@ and clients of the gateway.
 | Syscall filter | `socket()` and `socketpair()` allowed for `AF_UNIX` only. Probed: INET, INET6, raw INET, NETLINK, PACKET, VSOCK, ALG, XDP, Bluetooth, CAN, TIPC, RDS | `net.socket.*`, `net.socketpair.*` |
 | Filter bypasses | io_uring (performs socket operations without the filtered syscalls), `socketcall`, and the i386 and x32 ABIs are denied; the profile lists the native architecture only | `sys.io_uring_setup`, `abi.*` |
 | Host IPC | Abstract UNIX sockets are scoped to the network namespace; no host socket paths are mounted | `net.abstract_unix`, `host.sockets` |
-| Host firewall (optional, root) | nftables drops everything the sandbox's host UID originates | not probeable from inside; see `host/README.md` |
+| Host firewall (optional, root) | nftables drops everything the sandbox's host UID originates; `--sealed` stops the whole machine from sending anything but SSH replies | applied as root on test machines, see `docs/VPS.md`; `silo doctor --sealed` |
 
 The first two layers are independent: a process that somehow obtained a network namespace with
 interfaces still could not create an IP socket, and one that somehow bypassed the filter would
@@ -86,7 +87,7 @@ runtime does not run as that root either: it runs as UID 65534, which maps to a 
 that owns nothing on the host. All capabilities are dropped, the bounding set is empty,
 `no-new-privileges` is set, and SELinux confines the process as `container_t` with categories
 unique to the container. Verified by `proc.uid`, `proc.capabilities`, `proc.no_new_privs`,
-`proc.seccomp`, `proc.selinux`.
+`proc.seccomp`, `proc.lsm`.
 
 ### Filesystem and persistence
 
@@ -146,7 +147,8 @@ Stated plainly, in rough order of importance.
    SELinux and the user namespace are then the only things left. Use `seccomp_action = "kill"` so a
    probing exploit dies on its first denied call, keep the kernel patched, and apply the host
    sysctls. The real fix is a second kernel boundary (gVisor or a microVM), which silo does not
-   have yet.
+   have yet. Until it does, put the boundary around the machine: `docs/VPS.md` describes a
+   dedicated server that holds nothing and cannot start a connection.
 2. **The person reading the output.** A contained model can still write "run this". The tripwire
    recognises common shapes and can be evaded by any model capable enough to matter. Treat output
    as untrusted input, especially commands.
@@ -165,12 +167,16 @@ Stated plainly, in rough order of importance.
 7. **Information visible inside.** Kernel version, CPU details, memory size and the host path of
    the model directory (through the mount table) are readable in the sandbox.
 8. **Denial of service.** The sandbox can use all the CPU it is given and all of its memory cap.
-9. **The startup window.** From container start until about a millisecond after the socket is
+9. **Hosts without SELinux.** On Ubuntu, rootless Podman applies no SELinux or AppArmor policy, so
+   the sandbox process is not confined by any mandatory access control. Everything else is in
+   place there, but the layer that limits what a process can touch once it is past the others is
+   missing. `silo doctor` fails such a host and `silo probe` reports it.
+10. **The startup window.** From container start until about a millisecond after the socket is
    bound, the socket directory is writable by the sandbox UID. Model loading begins right after the
    bind, so its first instants fall inside that window. A model file that exploits the loader that
    quickly could write there: what it leaves behind fails the launch, but a brief fill of the
    runtime tmpfs is possible. The fix is not to share a directory at all.
-10. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
+11. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
     delivered. Only `enforce` withholds.
 
 ## Not goals
@@ -183,10 +189,11 @@ Stated plainly, in rough order of importance.
 ## Roadmap
 
 - gVisor (`runsc`) and libkrun microVM backends, for a kernel boundary that is not the host's.
+- Mandatory access control for the sandbox on AppArmor hosts.
 - Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - Locking down `execve` after the runtime has started.
 - An origin allowlist with proper CORS handling, for browser-based clients.
 - Tool-call mediation: per-tool policy instead of all-or-nothing.
 - Structural validation of GGUF files at intake.
-- The probe suite as a CI gate, and verification on GPU hardware, aarch64 and AppArmor hosts.
+- The probe suite as a CI gate, and verification on GPU hardware and aarch64.

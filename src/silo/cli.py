@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -40,7 +41,11 @@ def _announce(cfg: Config) -> None:
 def cmd_doctor(cfg: Config, args) -> int:
     _announce(cfg)
     worst = 0
-    for check in doctor.run_checks(cfg):
+    checks = doctor.run_checks(cfg)
+    if args.sealed:
+        _note(f"silo[{cfg.name}] --sealed: sending connection attempts to public addresses to prove they fail")
+        checks += doctor.sealed_checks()
+    for check in checks:
         mark = {"ok": "✓", "warn": "!", "bad": "✗"}[check.level]
         print(f" {_c(mark, STATUS_COLORS[check.level])} {check.name:<38} {check.detail}")
         if check.fix:
@@ -68,10 +73,28 @@ def cmd_seccomp(cfg: Config, args) -> int:
     return 0
 
 
+def _ssh_server_port() -> int | None:
+    """The port this SSH session came in on, if silo is being run from one."""
+    parts = os.environ.get("SSH_CONNECTION", "").split()
+    return int(parts[3]) if len(parts) == 4 and parts[3].isdigit() else None
+
+
 def cmd_nft(cfg: Config, args) -> int:
     uid = hostrules.sandbox_host_uid(hostrules.subuid_ranges())
-    print(hostrules.nft_ruleset(uid), end="")
-    _note("\n# review, then apply as root:  silo nft | sudo nft -f -")
+    if not args.sealed:
+        if args.ssh_port is not None:
+            raise ConfigError("--ssh-port only applies to --sealed")
+        print(hostrules.nft_ruleset(uid), end="")
+        _note("\n# review, then apply as root:  silo nft | sudo nft -f -")
+        return 0
+    detected = _ssh_server_port()
+    port = args.ssh_port or detected or 22
+    print(hostrules.nft_ruleset(uid, sealed=True, ssh_port=port), end="")
+    source = "--ssh-port" if args.ssh_port else ("this SSH session" if detected else "the default")
+    _note(f"\n# SSH server port allowed out: {port} (from {source}). If your SSH server listens on another\n"
+          "# port, loading this cuts you off: regenerate with --ssh-port N.\n"
+          "# Review, then apply as root. Check that a NEW SSH connection works before you make the rules\n"
+          "# permanent: until then, a reboot from your provider's panel removes them.")
     return 0
 
 
@@ -159,10 +182,30 @@ def cmd_logs(cfg: Config, args) -> int:
     return runtime.logs(cfg, follow=args.follow)
 
 
+def _print_images(infos: list[dict]) -> int:
+    missing = 0
+    for info in infos:
+        print(info["image"])
+        if not info["present"]:
+            missing += 1
+            print("  not present locally: `silo pull`, or `podman load` an archive made with `podman save`")
+            continue
+        print(f"  already pinned:           {'yes' if info['pinned'] else 'no (a tag can be moved)'}")
+        print(f"  pin by image ID:          {info['pin_by_id']}")
+        for digest in info["registry_digests"]:
+            print(f"  digest on this host:      {digest}")
+    print("\nPin by image ID: it is the same on every host, also after `podman save` / `podman load`.\n"
+          "The digest form only matches the registry's on a host that pulled the image; a loaded image\n"
+          "gets a different one.")
+    return 1 if missing else 0
+
+
+def cmd_images(cfg: Config, args) -> int:
+    return _print_images(runtime.images(cfg))
+
+
 def cmd_pull(cfg: Config, args) -> int:
-    for image, pinned in runtime.pull(cfg):
-        print(f"{image}\n  pin as: {pinned}")
-    return 0
+    return _print_images(runtime.pull(cfg))
 
 
 def cmd_probe(cfg: Config, args) -> int:
@@ -190,10 +233,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"silo {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("doctor", help="check host and configuration posture")
+    s = sub.add_parser("doctor", help="check host and configuration posture")
+    s.add_argument("--sealed", action="store_true",
+                   help="also verify that this host itself cannot reach the network (for a dedicated machine "
+                        "whose outbound traffic is denied by a firewall); sends probes to public addresses")
     s = sub.add_parser("seccomp", help="show or write the hardened seccomp profile")
     s.add_argument("--out", help="write the profile to this path")
-    sub.add_parser("nft", help="print the host firewall rule that drops all traffic from the sandbox UID")
+    s = sub.add_parser("nft", help="print the host firewall rule that drops all traffic from the sandbox UID")
+    s.add_argument("--sealed", action="store_true",
+                   help="print a ruleset that also stops the whole host from sending anything except SSH "
+                        "replies, DHCP and IPv6 neighbour discovery")
+    s.add_argument("--ssh-port", type=int, metavar="N",
+                   help="with --sealed: the port your SSH server listens on (default: the port of the SSH "
+                        "session silo is run from, else 22)")
     s = sub.add_parser("intake", help="vet the model directory and record a SHA-256 manifest")
     s.add_argument("--allow-unknown", action="store_true", help="accept files with unlisted extensions")
     s = sub.add_parser("verify", help="check the model directory against its manifest")
@@ -207,7 +259,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="show sandbox status")
     s = sub.add_parser("logs", help="show model runtime logs (control characters escaped)")
     s.add_argument("-f", "--follow", action="store_true")
-    sub.add_parser("pull", help="pull runtime and probe images and print digests to pin")
+    sub.add_parser("pull", help="pull runtime and probe images and print how to pin them")
+    sub.add_parser("images", help="show the local runtime and probe images and how to pin them (no network)")
     s = sub.add_parser("probe", help="run the escape-probe suite inside a sandbox")
     s.add_argument("--baseline", action="store_true", help="run against a stock container for comparison")
     s.add_argument("--json", action="store_true")
@@ -218,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "doctor": cmd_doctor, "seccomp": cmd_seccomp, "nft": cmd_nft, "intake": cmd_intake, "verify": cmd_verify,
     "up": cmd_up, "gateway": cmd_gateway, "down": cmd_down, "status": cmd_status, "logs": cmd_logs,
-    "pull": cmd_pull, "probe": cmd_probe,
+    "pull": cmd_pull, "images": cmd_images, "probe": cmd_probe,
 }
 
 

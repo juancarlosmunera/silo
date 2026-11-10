@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.resources
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -39,6 +40,7 @@ FORBIDDEN_SERVER_FLAGS = frozenset({
 SAFETY_SWITCHES = ["--offline", "--no-webui", "--no-webui-mcp-proxy", "--no-agent", "--no-slots"]
 
 SIGSYS_EXIT = 128 + 31
+_IMAGE_ID_RE = re.compile(r"^(sha256:)?[0-9a-f]{64}$")
 
 
 class LaunchError(RuntimeError):
@@ -390,13 +392,36 @@ def probe(cfg: Config, baseline: bool = False) -> tuple[int, list[dict]]:
     return (1 if any(r["status"] == "FAIL" for r in results) else 0), results
 
 
-def pull(cfg: Config) -> list[tuple[str, str]]:
-    pinned = []
+def is_pinned(image: str) -> bool:
+    """True if the reference names exact content: a registry digest or a full image ID."""
+    return "@sha256:" in image or bool(_IMAGE_ID_RE.match(image))
+
+
+def image_info(image: str) -> dict:
+    """What the local store holds for a reference, and the two ways to pin it.
+
+    A registry digest (`repo@sha256:...`) only exists for images that were pulled; `podman load`
+    assigns a different one. The image ID is the hash of the image's own configuration, layer
+    hashes included, and is the same wherever the image goes, so it is the pin that also works on a
+    host that received its images as archives.
+    """
+    res = run(["podman", "image", "inspect", "--format", "{{.Id}}\t{{json .RepoDigests}}", image], check=False)
+    if res.returncode != 0:
+        return {"image": image, "present": False, "pinned": is_pinned(image)}
+    image_id, _, digests = res.stdout.strip().partition("\t")
+    try:
+        digests = [d for d in json.loads(digests) or [] if isinstance(d, str)]
+    except json.JSONDecodeError:
+        digests = []
+    return {"image": image, "present": True, "pinned": is_pinned(image), "id": image_id,
+            "pin_by_id": f"sha256:{image_id}", "registry_digests": digests}
+
+
+def images(cfg: Config) -> list[dict]:
+    return [image_info(image) for image in dict.fromkeys([cfg.runtime.image, cfg.runtime.probe_image])]
+
+
+def pull(cfg: Config) -> list[dict]:
     for image in dict.fromkeys([cfg.runtime.image, cfg.runtime.probe_image]):
         subprocess.run(["podman", "pull", image], check=True)
-        digest = run(["podman", "image", "inspect", "--format", "{{.Digest}}", image]).stdout.strip()
-        repo = image.split("@", 1)[0]
-        if ":" in repo.rsplit("/", 1)[-1]:
-            repo = repo[: repo.rfind(":")]
-        pinned.append((image, f"{repo}@{digest}"))
-    return pinned
+    return images(cfg)

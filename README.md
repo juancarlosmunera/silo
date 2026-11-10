@@ -20,15 +20,16 @@ Inside that box the runtime cannot open a connection, resolve a name, read your 
 anything on the host. What it can still do is answer, so the answer is the one channel left, and
 the gateway exists to narrow and record it.
 
-> **Status: 0.1, early.** Verified on Fedora 43 (SELinux enforcing) with rootless Podman 5.8,
-> x86_64, CPU inference, running llama.cpp's server. Not yet verified: GPU passthrough, aarch64,
-> hosts without SELinux. silo lowers risk; it is not a guarantee. Read [Limits](#limits) before
-> relying on it.
+> **Status: 0.1, early.** Verified on Fedora 43 (SELinux enforcing) with rootless Podman 5.6 and
+> 5.8, x86_64, CPU inference, running llama.cpp's server. Also exercised on Ubuntu 24.04, where one
+> layer is missing ([details](docs/VPS.md#other-distributions)). Not yet verified: GPU passthrough,
+> aarch64. silo lowers risk; it is not a guarantee. Read [Limits](#limits) before relying on it.
 
 **Contents:** [Isn't a container enough?](#isnt-a-container-enough) ·
 [How it works](#how-it-works) · [Check it yourself](#check-it-yourself) ·
 [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start) ·
-[Commands](#commands) · [Configuration](#configuration) · [The gateway](#the-gateway) ·
+[On a VPS](#on-a-vps) · [Commands](#commands) · [Configuration](#configuration) ·
+[The gateway](#the-gateway) ·
 [Tightening it further](#tightening-it-further) · [Limits](#limits) · [Roadmap](#roadmap) ·
 [Development](#development) · [Security](#security) · [License](#license)
 
@@ -97,7 +98,8 @@ configuration, not the ones silo was developed on.
 
 - Linux on x86_64 with cgroup v2.
 - Podman, running rootless. Verified with 5.8. Docker is not supported.
-- SELinux in enforcing mode is strongly recommended, and is what silo is verified with.
+- SELinux in enforcing mode is strongly recommended, and is what silo is verified with. On Ubuntu
+  rootless Podman gets no SELinux or AppArmor confinement at all, so that layer is absent there.
   `silo doctor` reports what your host provides.
 - Python 3.11 or newer. silo has no Python dependencies.
 - A model in GGUF format and enough RAM to hold it. Inference runs on the CPU.
@@ -153,7 +155,7 @@ file = "SmolLM2-135M-Instruct-Q8_0.gguf"
 
 ```sh
 silo doctor     # host and configuration posture, and what could be stricter
-silo pull       # pull the two container images; prints digests to pin in silo.toml
+silo pull       # pull the two container images; prints how to pin them in silo.toml
 silo intake     # vet the model directory and record its SHA-256 manifest
 silo probe      # run the escape probes in a sandbox identical to the model's
 ```
@@ -205,12 +207,24 @@ Streaming works the same way. Browser-based clients are refused: any request tha
 
 Ctrl-C stops the gateway and the sandbox and removes the socket directory.
 
+## On a VPS
+
+A machine that exists only to run the model can be given a boundary your workstation cannot have:
+it holds nothing, and it can be forbidden from starting any connection at all. Then even a kernel
+exploit leaves the attacker on a box that cannot call out.
+
+[docs/VPS.md](docs/VPS.md) is the full walkthrough, tested end to end on a fresh Fedora machine:
+a dedicated unprivileged account, images and model pushed over SSH so the server needs no outbound
+access, firewall rules that seal the host, a systemd service, and an SSH tunnel to the gateway.
+`silo doctor --sealed` then proves from the machine itself that nothing gets out.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `silo doctor` | Checks the host (Podman, SELinux, cgroups, kernel settings) and your configuration, and lists what could be stricter. |
-| `silo pull` | Pulls the runtime and probe images and prints their digests so you can pin them. silo never pulls at launch. |
+| `silo doctor [--sealed]` | Checks the host (Podman, SELinux, cgroups, kernel settings) and your configuration, and lists what could be stricter. `--sealed` also proves that the host itself cannot reach the network. |
+| `silo pull` | Pulls the runtime and probe images and prints how to pin them. silo never pulls at launch. |
+| `silo images` | Shows the local images and how to pin them, without touching the network. |
 | `silo intake [--allow-unknown]` | Vets the model directory and writes its manifest. |
 | `silo verify [--full]` | Compares the model directory with its manifest. `--full` rehashes every file. |
 | `silo probe [--baseline] [-q] [--json]` | Runs the escape probes in a silo sandbox, or in a stock container for comparison. |
@@ -218,7 +232,7 @@ Ctrl-C stops the gateway and the sandbox and removes the socket directory.
 | `silo gateway` | Serves the gateway for a sandbox started with `up --detach`. |
 | `silo status`, `silo logs [-f]`, `silo down` | Shows state, prints runtime logs with control characters escaped, stops and cleans up. |
 | `silo seccomp [--out FILE]` | Shows what silo removes from the stock seccomp profile, or writes the hardened profile. |
-| `silo nft` | Prints a host firewall rule that drops all traffic from the sandbox user. See [host/](host/README.md). |
+| `silo nft [--sealed]` | Prints a host firewall rule that drops all traffic from the sandbox user. `--sealed` prints one that stops the whole machine from sending anything but SSH replies. See [host/](host/README.md). |
 
 Configuration is read from `--config PATH`, else `$SILO_CONFIG`, else `~/.config/silo/silo.toml`,
 and silo prints which file it used whenever it launches something. It is never read from the
@@ -236,7 +250,7 @@ The settings that matter most. Every option, with comments, is in
 | `model.ctx_size` | `4096` | Context window passed to llama-server. |
 | `runtime.memory` | `"8g"` | Hard memory cap, with no swap on top. It has to fit the model plus its context. |
 | `runtime.seccomp_action` | `"errno"` | `"errno"` makes denied syscalls fail. `"kill"` terminates the runtime on the first one. |
-| `runtime.image` | llama.cpp server | Pin it by digest with the output of `silo pull`. |
+| `runtime.image` | llama.cpp server | Pin it with the image ID printed by `silo images`. |
 | `runtime.gpu` | `"none"` | GPU passthrough. Exposes a GPU driver to the sandbox and is not yet verified. |
 | `gateway.listen`, `gateway.port` | `127.0.0.1`, `8088` | A non-loopback address is refused unless `api_key_env` is set. |
 | `gateway.scanner` | `"monitor"` | `"off"`, `"monitor"` (log and alert) or `"enforce"` (withhold high-severity completions). |
@@ -277,7 +291,7 @@ The defaults favour getting a model running. Once yours runs cleanly:
 1. Set `runtime.seccomp_action = "kill"`. A compromised runtime that probes for a way out then dies
    on its first denied call, which you will notice, instead of getting an error and trying the next.
 2. Set `gateway.scanner = "enforce"`.
-3. Pin both images by digest with the output of `silo pull`.
+3. Pin both images with the IDs printed by `silo images`.
 4. Apply the host firewall rule and the kernel settings in [host/](host/README.md). They need root
    and are the layers that still stand if something gets out of the container.
 5. Set `gateway.api_key_env` if other users or untrusted processes share the machine.
@@ -290,8 +304,8 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 
 - **The kernel is shared.** A kernel vulnerability reachable through the roughly 320 syscalls still
   allowed is the main way out. silo shrinks that surface; it does not remove it. Until silo has a
-  second kernel boundary of its own, add one from outside: run it on a dedicated VPS whose outbound
-  traffic is denied in the provider's firewall, or inside a VM with no network adapter.
+  second kernel boundary of its own, add one from outside: run it on a dedicated, sealed VPS
+  ([docs/VPS.md](docs/VPS.md)), or inside a VM with no network adapter.
 - **The answer still reaches you.** A model with no network can ask you to run something. The
   tripwire catches obvious shapes and is a regex, not a boundary. Treat output as untrusted input.
 - **Your client is outside the silo.** If it renders HTML, fetches images or executes tool calls,
@@ -303,8 +317,8 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 
 ## Roadmap
 
-- A deployment guide for VPS hosts.
 - A second kernel boundary: gVisor or a microVM as the sandbox backend.
+- Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
 - Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - An origin allowlist with proper CORS handling, for browser-based clients.
@@ -331,8 +345,11 @@ src/silo/runtime.py     lifecycle: launch, socket-directory lock, probes
 src/silo/probes/        the escape-probe suite that runs inside the sandbox
 src/silo/doctor.py      host and configuration checks
 src/silo/hostrules.py   host firewall rule generation
-host/                   optional root-level hardening: firewall rule, sysctls
+bin/silo                runs silo from a checkout, ignoring the current directory
+host/                   optional root-level hardening: firewall rules, sysctls
+examples/               annotated configuration, systemd unit
 docs/THREAT_MODEL.md    assumptions, controls, residual risk
+docs/VPS.md             deploying on a rented server, step by step
 ```
 
 ## Security

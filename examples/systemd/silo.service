@@ -1,0 +1,26 @@
+# systemd user unit: run the sandbox and the gateway as a service of an unprivileged account.
+#
+#   mkdir -p ~/.config/systemd/user && cp examples/systemd/silo.service ~/.config/systemd/user/
+#   sudo loginctl enable-linger "$USER"     # keep this account's services and runtime directory without a login
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now silo
+#   journalctl --user -u silo -f            # startup, gateway alerts
+#
+# Adjust ExecStart if silo lives somewhere else or you use a venv (ExecStart=%h/silo/.venv/bin/silo up).
+
+[Unit]
+Description=silo: sandboxed local LLM (sandbox and gateway)
+Documentation=https://github.com/juancarlosmunera/silo
+
+[Service]
+Type=simple
+ExecStart=%h/silo/bin/silo up
+# On stop, systemd signals silo only; silo stops the container and removes the socket directory
+# itself. Whatever is still around after the timeout is killed.
+KillMode=mixed
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

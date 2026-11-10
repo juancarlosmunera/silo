@@ -525,17 +525,26 @@ def probe_pid_namespace():
     record("proc.pid_namespace", "PASS", f"{len(pids)} processes visible")
 
 
-def probe_selinux():
+def probe_lsm():
+    """Is the process confined by a mandatory access control policy (SELinux or AppArmor)?"""
     try:
         with open("/proc/self/attr/current") as fh:
             label = fh.read().strip("\0\n ")
     except OSError:
-        return record("proc.selinux", "SKIP", "no SELinux label (LSM not enabled)")
+        return record("proc.lsm", "WARN", "no LSM label readable: not confined by SELinux or AppArmor")
     if not label or label == "unconfined":
-        return record("proc.selinux", "SKIP", f"no SELinux confinement reported ({label or 'empty'})")
-    if "container_t" in label or "container_" in label:
-        return record("proc.selinux", "PASS", f"confined as {label}")
-    record("proc.selinux", "WARN", f"unexpected label {label}")
+        return record("proc.lsm", "WARN", "not confined by SELinux or AppArmor")
+    if label.endswith(")") and " (" in label:  # AppArmor: "<profile> (<mode>)"
+        profile, _, mode = label[:-1].rpartition(" (")
+        if mode == "enforce":
+            return record("proc.lsm", "PASS", f"confined by AppArmor profile {profile}")
+        return record("proc.lsm", "WARN", f"not confined: AppArmor profile '{profile}' is in {mode} mode")
+    fields = label.split(":")
+    if len(fields) >= 3:  # SELinux: user:role:type[:level[:categories]]
+        if fields[2].startswith("container_") and fields[2] != "container_runtime_t":
+            return record("proc.lsm", "PASS", f"confined by SELinux as {label}")
+        return record("proc.lsm", "WARN", f"not confined as a container: SELinux type {fields[2]} ({label})")
+    record("proc.lsm", "WARN", f"unrecognised LSM label {label}")
 
 
 SENSITIVE_ENV = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "PROXY", "SSH_AUTH_SOCK", "DBUS", "DISPLAY",
@@ -633,7 +642,7 @@ def main():
     for fn in (probe_interfaces, probe_routes, probe_socket_families, probe_socketpair, probe_dns,
                probe_tcp_egress, probe_abstract_unix, probe_syscalls, probe_clone_newuser, probe_compat_abi,
                probe_readonly, probe_socket_dir, probe_tmp_noexec, probe_memfd_exec, probe_mounts,
-               probe_host_artifacts, probe_credentials, probe_pid_namespace, probe_selinux, probe_environment,
+               probe_host_artifacts, probe_credentials, probe_pid_namespace, probe_lsm, probe_environment,
                probe_cgroup_limits, probe_devices, probe_pty, probe_kernel_leaks):
         try:
             fn()

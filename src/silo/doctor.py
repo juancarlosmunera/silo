@@ -7,16 +7,23 @@ setting available and says what it costs.
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
+import re
 import shutil
+import socket
+import struct
 import subprocess
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from silo.config import Config
 
 OK, WARN, BAD = "ok", "warn", "bad"
+_IMAGE_ID_RE = re.compile(r"^(sha256:)?[0-9a-f]{64}$")
 
 
 @dataclass
@@ -129,11 +136,14 @@ def run_checks(cfg: Config) -> list[Check]:
 
     # ------------------------------------------------------------------------ images and model files
     for label, image in (("model image", cfg.runtime.image), ("probe image", cfg.runtime.probe_image)):
-        pinned = "@sha256:" in image
+        pinned = "@sha256:" in image or bool(_IMAGE_ID_RE.match(image))
         present = subprocess.run(["podman", "image", "exists", image]).returncode == 0
         level = OK if pinned and present else (WARN if present else BAD)
-        detail = f"{image} ({'digest-pinned' if pinned else 'mutable tag'}, {'present' if present else 'not pulled'})"
-        fix = "" if level == OK else "run `silo pull` and pin the printed digest in silo.toml"
+        detail = f"{image} ({'pinned' if pinned else 'mutable tag'}, {'present' if present else 'not present'})"
+        if not present:
+            fix = "`silo pull`, or `podman load` an archive on a host without network access"
+        else:
+            fix = "" if pinned else "run `silo images` and put the printed image ID in silo.toml"
         add(Check(label, level, detail, fix))
     if cfg.model.dir:
         if cfg.manifest_path.is_file():
@@ -162,4 +172,177 @@ def run_checks(cfg: Config) -> list[Check]:
                   "that executor is now your containment boundary; sandbox it too"))
     else:
         add(Check("tool calling", OK, "refused: the model can only produce text"))
+    checks.extend(session_checks())
+    return checks
+
+
+# ----------------------------------------------------------------------------- remote / server hosts
+
+def _linger() -> bool | None:
+    try:
+        res = subprocess.run(["loginctl", "show-user", getpass.getuser(), "--property=Linger", "--value"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired, KeyError):
+        return None
+    return {"yes": True, "no": False}.get(res.stdout.strip())
+
+
+def _virtualization() -> str | None:
+    try:
+        res = subprocess.run(["systemd-detect-virt", "--vm"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    kind = res.stdout.strip()
+    if not kind or kind == "none":
+        return None
+    try:
+        vendor = Path("/sys/class/dmi/id/sys_vendor").read_text().strip()
+    except OSError:
+        vendor = ""
+    return f"{kind} ({vendor})" if vendor else kind
+
+
+def session_checks() -> list[Check]:
+    """Things that only matter when silo runs on a machine you reach over SSH."""
+    checks: list[Check] = []
+    remote = bool(os.environ.get("SSH_CONNECTION"))
+    if remote and os.environ.get("SSH_AUTH_SOCK"):
+        checks.append(Check("SSH agent forwarding", WARN, "an SSH agent is reachable from this session",
+                            "whoever takes over this host can use your keys while you are connected: "
+                            "connect with `ssh -a`"))
+    elif remote:
+        checks.append(Check("SSH agent forwarding", OK, "no agent reachable from this session"))
+    linger = _linger()
+    graphical = os.environ.get("XDG_SESSION_TYPE") in ("wayland", "x11")
+    if linger:
+        checks.append(Check("user lingering", OK, "on: this account's services outlive its login sessions"))
+    elif linger is False and (remote or not graphical):
+        checks.append(Check("user lingering", WARN, "off: the runtime directory, and the sandbox with it, goes "
+                            "away when you log out", f"sudo loginctl enable-linger {getpass.getuser()}"))
+    virt = _virtualization()
+    if virt:
+        checks.append(Check("virtual machine", OK, f"{virt}: on a rented server, deny outbound traffic in the "
+                            "provider's firewall and confirm with `silo doctor --sealed`"))
+    return checks
+
+
+# ------------------------------------------------------------------------------------- sealed host
+#
+# `silo doctor --sealed` is for a machine dedicated to the model, whose outbound traffic is supposed
+# to be denied from outside (docs/VPS.md). It proves that by trying to get out the ways an escaped
+# process would, from the host itself. It is opt-in because it sends packets to public addresses.
+
+_DEFINITE_DNS_ANSWERS = {getattr(socket, name) for name in ("EAI_NONAME", "EAI_NODATA") if hasattr(socket, name)}
+PUBLIC_V4 = "1.1.1.1"
+PUBLIC_V4_ALT = "8.8.8.8"
+PUBLIC_V6 = "2606:4700:4700::1111"
+METADATA = "169.254.169.254"
+
+
+def _why(exc: OSError) -> str:
+    return exc.strerror or type(exc).__name__
+
+
+def _tcp(family: int, address: tuple[str, int], timeout: float = 3.0) -> tuple[bool | None, str]:
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError as exc:
+        return None, f"not testable ({_why(exc)})"
+    with sock:
+        sock.settimeout(timeout)
+        try:
+            sock.connect(address)
+            return True, "connected"
+        except ConnectionRefusedError:
+            # The targets are public services that are known to listen, so a refusal does not come
+            # from them: a firewall or router on the way rejected the connection instead of dropping it.
+            return False, "rejected on the way"
+        except OSError as exc:
+            return False, _why(exc)
+
+
+def _udp_dns(address: tuple[str, int], timeout: float = 3.0) -> tuple[bool | None, str]:
+    query = (struct.pack("!HHHHHH", uuid.uuid4().int & 0xFFFF, 0x0100, 1, 0, 0, 0)
+             + b"\x07example\x03com\x00" + struct.pack("!HH", 1, 1))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(query, address)
+            sock.recvfrom(2048)
+            return True, "a DNS answer came back"
+        except OSError as exc:
+            return False, _why(exc)
+
+
+def _icmp(address: str = PUBLIC_V4, timeout: float = 2.0) -> tuple[bool | None, str]:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+    except OSError as exc:  # unprivileged ICMP sockets are a per-group sysctl
+        return None, f"not testable without privileges ({_why(exc)})"
+    with sock:
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(struct.pack("!BBHHH", 8, 0, 0, 0, 1) + b"silo doctor", (address, 0))
+            sock.recvfrom(2048)
+            return True, "echo reply received"
+        except OSError as exc:
+            return False, _why(exc)
+
+
+def _system_resolver(timeout: float = 6.0) -> tuple[bool | None, str]:
+    """Ask the configured resolver for a name nobody has cached.
+
+    Some clouds exempt their own resolver from firewall rules, which leaves DNS as a data channel
+    even when every direct connection is blocked. Any definite answer, a negative one included,
+    means the resolver reached the internet on this host's behalf.
+    """
+    name = f"{uuid.uuid4().hex}.example.com"
+    result: list[tuple[bool, str]] = []
+
+    def lookup() -> None:
+        try:
+            socket.getaddrinfo(name, None)
+            result.append((True, "the name resolved"))
+        except socket.gaierror as exc:
+            # "no such name" and "no address" are answers; "try again" is what an unreachable
+            # resolver produces.
+            if exc.errno in _DEFINITE_DNS_ANSWERS:
+                result.append((True, f"the resolver returned a definite answer ({exc.strerror})"))
+            else:
+                result.append((False, exc.strerror or "lookup failed"))
+        except OSError as exc:
+            result.append((False, _why(exc)))
+
+    thread = threading.Thread(target=lookup, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return result[0] if result else (False, "no answer")
+
+
+def sealed_checks() -> list[Check]:
+    probes = [
+        (f"egress: TCP to {PUBLIC_V4}:443", lambda: _tcp(socket.AF_INET, (PUBLIC_V4, 443))),
+        (f"egress: TCP to {PUBLIC_V4_ALT}:53", lambda: _tcp(socket.AF_INET, (PUBLIC_V4_ALT, 53))),
+        ("egress: TCP over IPv6", lambda: _tcp(socket.AF_INET6, (PUBLIC_V6, 443))),
+        (f"egress: UDP DNS to {PUBLIC_V4}", lambda: _udp_dns((PUBLIC_V4, 53))),
+        (f"egress: ICMP echo to {PUBLIC_V4}", _icmp),
+        ("egress: DNS through the system resolver", _system_resolver),
+    ]
+    checks = []
+    for name, probe in probes:
+        reached, detail = probe()
+        if reached:
+            checks.append(Check(name, BAD, f"OPEN: {detail}", "this host is not sealed: deny outbound traffic in the "
+                                "provider's firewall, or apply `silo nft --sealed` (docs/VPS.md)"))
+        elif reached is None:
+            checks.append(Check(name, OK, detail))
+        else:
+            checks.append(Check(name, OK, f"blocked ({detail})"))
+    reached, detail = _tcp(socket.AF_INET, (METADATA, 80), timeout=2.0)
+    if reached:
+        checks.append(Check("cloud metadata service", WARN, f"reachable at {METADATA}: {detail}",
+                            "anything that reaches this host can read it: attach no role or API keys to the "
+                            "instance and keep secrets out of user-data (`silo nft --sealed` also blocks it)"))
+    else:
+        checks.append(Check("cloud metadata service", OK, f"not reachable ({detail})"))
     return checks

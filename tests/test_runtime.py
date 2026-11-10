@@ -46,6 +46,14 @@ class ServerCommandTests(unittest.TestCase):
             with self.subTest(flag=flag), self.assertRaises(ConfigError):
                 runtime.server_command(cfg_with([flag, "x"]))
 
+    def test_only_exact_content_counts_as_pinned(self):
+        digest = "a" * 64
+        for ref in (f"ghcr.io/ggml-org/llama.cpp@sha256:{digest}", f"sha256:{digest}", digest):
+            self.assertTrue(runtime.is_pinned(ref), ref)
+        for ref in ("ghcr.io/ggml-org/llama.cpp:server", "python:3.13-slim", digest[:12], f"sha256:{digest[:12]}",
+                    "localhost/llama:sha256", digest.upper()):
+            self.assertFalse(runtime.is_pinned(ref), ref)
+
     def test_model_required(self):
         with self.assertRaises(ConfigError):
             runtime.server_command(Config())
