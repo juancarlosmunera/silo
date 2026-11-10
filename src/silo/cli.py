@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from silo import __version__, doctor, gateway, hostrules, intake, runtime, seccomp
-from silo.config import Config, ConfigError, load
+from silo.config import Config, ConfigError, default_config_path, load
 from silo.sandbox import HardeningError
 from silo.util import safe_text
 
@@ -32,6 +32,9 @@ def _note(text: str) -> None:
 def _announce(cfg: Config) -> None:
     # The config picks the image, the model directory and the seccomp base: never use one silently.
     _note(f"silo[{cfg.name}] config: {cfg.source or 'built-in defaults (no silo.toml found)'}")
+    if cfg.source is None and Path("silo.toml").is_file():
+        _note(f"silo[{cfg.name}] note: ./silo.toml is not read. silo never takes configuration from the "
+              f"current directory; pass --config silo.toml or move it to {default_config_path()}")
 
 
 def cmd_doctor(cfg: Config, args) -> int:

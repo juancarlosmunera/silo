@@ -1,4 +1,5 @@
-# silo configuration. Copy to ./silo.toml or ~/.config/silo/silo.toml.
+# silo configuration. Copy to ~/.config/silo/silo.toml, or pass it with --config or $SILO_CONFIG.
+# silo never reads a config file from the current directory.
 # Unknown keys and wrong types are errors. Everything except [model] has a default.
 
 [silo]

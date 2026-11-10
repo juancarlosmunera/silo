@@ -115,8 +115,11 @@ pip install .
 silo --version
 ```
 
-Or skip the install and run it in place with `PYTHONPATH=src python3 -m silo` wherever the
-examples say `silo`.
+Or skip the install: `bin/silo` runs straight from the checkout, wherever the examples say `silo`.
+
+Do not run silo as `python3 -m silo`. That form puts the current directory first on Python's import
+path, so running it from inside a downloaded model directory would execute a `json.py` planted
+there. The `silo` command and `bin/silo` do not look in the current directory.
 
 ## Quick start
 
@@ -136,7 +139,8 @@ vetted format.
 **2. Configure.** Copy the example and point it at the model:
 
 ```sh
-cp examples/silo.example.toml silo.toml
+mkdir -p ~/.config/silo
+cp examples/silo.example.toml ~/.config/silo/silo.toml
 ```
 
 ```toml
@@ -171,7 +175,7 @@ silo up
 ```
 
 ```
-silo[default] config: /home/you/silo/silo.toml
+silo[default] config: /home/you/.config/silo/silo.toml
 silo[default] starting silo-default from ghcr.io/ggml-org/llama.cpp:server
 silo[default] model healthy on /run/user/1000/silo/default/llama.sock (socket directory locked)
 silo[default] gateway on http://127.0.0.1:8088/v1  ->  /run/user/1000/silo/default/llama.sock
@@ -216,8 +220,10 @@ Ctrl-C stops the gateway and the sandbox and removes the socket directory.
 | `silo seccomp [--out FILE]` | Shows what silo removes from the stock seccomp profile, or writes the hardened profile. |
 | `silo nft` | Prints a host firewall rule that drops all traffic from the sandbox user. See [host/](host/README.md). |
 
-Configuration is read from `--config PATH`, then `./silo.toml`, then `~/.config/silo/silo.toml`.
-silo prints which file it used whenever it launches something.
+Configuration is read from `--config PATH`, else `$SILO_CONFIG`, else `~/.config/silo/silo.toml`,
+and silo prints which file it used whenever it launches something. It is never read from the
+current directory: silo is routinely run next to files it does not trust, and a downloaded model
+must not be able to bring its own `silo.toml`.
 
 ## Configuration
 

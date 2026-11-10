@@ -1,9 +1,11 @@
 """Configuration loading.
 
-Config is TOML, searched in order: --config PATH, ./silo.toml, $XDG_CONFIG_HOME/silo/silo.toml.
-The file is trusted input (it chooses the image, the model directory and the base seccomp profile),
-so commands that launch something print which file they used. Unknown keys and wrong types are
-errors: in a containment tool a silently ignored typo is a silently missing control.
+Config is TOML, taken from --config PATH, else $SILO_CONFIG, else $XDG_CONFIG_HOME/silo/silo.toml.
+The file is trusted input: it chooses the image, the model directory and the base seccomp profile.
+That is why it is never looked up in the current directory (silo is routinely run from model
+directories, and a downloaded model must not be able to bring its own silo.toml), and why commands
+that launch something print which file they used. Unknown keys and wrong types are errors: in a
+containment tool a silently ignored typo is a silently missing control.
 """
 
 from __future__ import annotations
@@ -214,20 +216,22 @@ def validate(cfg: Config) -> Config:
     return cfg
 
 
+def default_config_path() -> Path:
+    return config_root() / "silo.toml"
+
+
 def load(path: Path | None = None) -> Config:
-    candidates = [path] if path else [Path("silo.toml"), config_root() / "silo.toml"]
-    for candidate in candidates:
-        if candidate and candidate.is_file():
-            try:
-                with candidate.open("rb") as fh:
-                    data = tomllib.load(fh)
-            except tomllib.TOMLDecodeError as exc:
-                raise ConfigError(f"{candidate}: {exc}") from exc
-            break
-    else:
-        if path:
-            raise ConfigError(f"config file not found: {path}")
+    explicit = path or (Path(os.environ["SILO_CONFIG"]) if os.environ.get("SILO_CONFIG") else None)
+    candidate = explicit or default_config_path()
+    if not candidate.is_file():
+        if explicit:
+            raise ConfigError(f"config file not found: {explicit}")
         return validate(Config())
+    try:
+        with candidate.open("rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{candidate}: {exc}") from exc
 
     unknown = set(data) - {"silo", "model", "runtime", "gateway"}
     if unknown:

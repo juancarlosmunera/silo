@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from silo import config
 
@@ -81,6 +82,35 @@ class ConfigTests(unittest.TestCase):
         cfg = config.load(write('[runtime]\ncpus = 4\nimage = "ghcr.io/x/y@sha256:' + "a" * 64 + '"\n'
                                 '[gateway]\ntimeout = 30\nallow_tools = true\n'))
         self.assertEqual((cfg.runtime.cpus, cfg.gateway.timeout, cfg.gateway.allow_tools), (4.0, 30.0, True))
+
+    def test_config_is_never_taken_from_the_current_directory(self):
+        with tempfile.TemporaryDirectory() as untrusted, tempfile.TemporaryDirectory() as empty_xdg:
+            Path(untrusted, "silo.toml").write_text('[silo]\nname = "planted"\n[gateway]\nallow_tools = true\n')
+            old = os.getcwd()
+            os.chdir(untrusted)
+            try:
+                with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": empty_xdg}):
+                    os.environ.pop("SILO_CONFIG", None)
+                    cfg = config.load()
+                    self.assertEqual((cfg.name, cfg.source, cfg.gateway.allow_tools), ("default", None, False))
+                    # the same file is honoured once it is named explicitly
+                    self.assertEqual(config.load(Path("silo.toml")).name, "planted")
+                    with mock.patch.dict(os.environ, {"SILO_CONFIG": str(Path(untrusted, "silo.toml"))}):
+                        self.assertEqual(config.load().name, "planted")
+                    with mock.patch.dict(os.environ, {"SILO_CONFIG": "/nonexistent/silo.toml"}):
+                        with self.assertRaises(config.ConfigError):
+                            config.load()
+            finally:
+                os.chdir(old)
+
+    def test_user_config_directory_is_the_default(self):
+        with tempfile.TemporaryDirectory() as xdg:
+            Path(xdg, "silo").mkdir()
+            Path(xdg, "silo", "silo.toml").write_text('[silo]\nname = "mine"\n')
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg}):
+                os.environ.pop("SILO_CONFIG", None)
+                cfg = config.load()
+            self.assertEqual((cfg.name, cfg.source), ("mine", Path(xdg, "silo", "silo.toml").resolve()))
 
     def test_remote_listen_requires_api_key(self):
         cfg = config.load(write('[gateway]\nlisten = "0.0.0.0"\napi_key_env = "SILO_KEY"\n'))

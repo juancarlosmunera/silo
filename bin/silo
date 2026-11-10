@@ -1,0 +1,18 @@
+#!/usr/bin/env -S python3 -I
+"""Run silo straight from a checkout, with nothing installed.
+
+-I (isolated mode) matters here: silo is routinely run from directories it does not trust, such as
+a freshly downloaded model directory. In isolated mode Python does not put the current directory or
+the script's directory on the import path and ignores PYTHONPATH, so a `json.py` or `silo.py`
+planted next to a model cannot be imported in place of the real thing. `python3 -m silo` gives no
+such protection: -m puts the current directory first.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from silo.cli import main  # noqa: E402
+
+raise SystemExit(main())
