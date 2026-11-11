@@ -1,5 +1,6 @@
 import os
 import socket
+import subprocess
 import threading
 import unittest
 from unittest import mock
@@ -87,11 +88,10 @@ class EgressProbeTests(unittest.TestCase):
 
 
 class SessionCheckTests(unittest.TestCase):
-    def checks(self, env, linger, virt=None):
+    def checks(self, env, linger):
         clean = {k: v for k, v in os.environ.items() if k not in ("SSH_CONNECTION", "SSH_AUTH_SOCK", "XDG_SESSION_TYPE")}
         with mock.patch.dict(os.environ, {**clean, **env}, clear=True), \
-                mock.patch.object(doctor, "_linger", return_value=linger), \
-                mock.patch.object(doctor, "_virtualization", return_value=virt):
+                mock.patch.object(doctor, "_linger", return_value=linger):
             return {c.name: c for c in doctor.session_checks()}
 
     def test_desktop_session_is_quiet(self):
@@ -107,13 +107,79 @@ class SessionCheckTests(unittest.TestCase):
 
     def test_ssh_session_set_up_properly(self):
         found = self.checks({"SSH_CONNECTION": "198.51.100.9 50000 203.0.113.4 22", "XDG_SESSION_TYPE": "tty"},
-                            linger=True, virt="kvm (Hetzner)")
+                            linger=True)
+        self.assertEqual(set(found), {"SSH agent forwarding", "user lingering"})
         self.assertEqual({c.level for c in found.values()}, {doctor.OK})
-        self.assertIn("--sealed", found["virtual machine"].detail)
 
     def test_local_agent_on_a_desktop_is_not_agent_forwarding(self):
         self.assertNotIn("SSH agent forwarding",
                          self.checks({"SSH_AUTH_SOCK": "/run/user/1000/keyring/ssh", "XDG_SESSION_TYPE": "wayland"}, True))
+
+
+class KernelIsolationTests(unittest.TestCase):
+    """The one finding that says where a kernel exploit would land."""
+
+    def test_physical_machine_points_at_the_boundaries_silo_ships(self):
+        for sealed in (None, True, False):  # a sealed physical machine still shares its kernel with the sandbox
+            check = doctor.kernel_isolation_check(None, sealed, [])
+            self.assertEqual(check.level, doctor.WARN)
+            self.assertIn("your own account", check.detail)
+            self.assertIn("docs/LOCAL_VM.md", check.fix)
+            self.assertIn("docs/VPS.md", check.fix)
+            self.assertNotIn("roadmap", check.detail + check.fix)
+
+    def test_installed_but_unused_runtimes_are_named(self):
+        check = doctor.kernel_isolation_check(None, None, ["runsc"])
+        self.assertIn("runsc is installed; silo does not use it yet", check.detail)
+        self.assertNotIn("installed", doctor.kernel_isolation_check(None, None, []).detail)
+
+    def test_virtual_machine_counts_only_once_it_is_shown_to_be_sealed(self):
+        untested = doctor.kernel_isolation_check("kvm, QEMU", None, [])
+        self.assertEqual(untested.level, doctor.WARN)
+        self.assertIn("silo doctor --sealed", untested.fix)
+        sealed = doctor.kernel_isolation_check("kvm, QEMU", True, [])
+        self.assertEqual((sealed.level, sealed.fix), (doctor.OK, ""))
+        self.assertIn("kvm, QEMU", sealed.detail)
+        leaking = doctor.kernel_isolation_check("kvm, QEMU", False, [])
+        self.assertEqual(leaking.level, doctor.WARN)
+        self.assertIn("can reach the network", leaking.detail)
+
+
+class RunChecksTests(unittest.TestCase):
+    """run_checks end to end, with the host tools it shells out to replaced."""
+
+    PODMAN = {"host": {"security": {"rootless": True, "selinuxEnabled": True}, "ociRuntime": {"name": "crun"},
+                       "cgroupVersion": "v2", "cgroupControllers": ["cpu", "memory", "pids"]}}
+
+    def run_checks(self, virt, sealed, systemctl_missing=False):
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "systemctl" and systemctl_missing:
+                raise FileNotFoundError("systemctl")
+            return subprocess.CompletedProcess(cmd, 0, stdout="inactive\n", stderr="")
+
+        from silo.config import Config
+        with mock.patch.object(doctor.shutil, "which", side_effect=lambda name: "/usr/bin/podman" if name == "podman" else None), \
+                mock.patch.object(doctor, "_podman_info", return_value=self.PODMAN), \
+                mock.patch.object(doctor, "_virtualization", return_value=virt), \
+                mock.patch.object(doctor, "_linger", return_value=None), \
+                mock.patch.object(doctor.subprocess, "run", side_effect=fake_run):
+            return {c.name: c for c in doctor.run_checks(Config(), sealed=sealed)}
+
+    def test_sealed_result_reaches_the_kernel_isolation_finding(self):
+        self.assertEqual(self.run_checks("kvm, QEMU", True)["kernel isolation"].level, doctor.OK)
+        self.assertEqual(self.run_checks("kvm, QEMU", False)["kernel isolation"].level, doctor.WARN)
+        self.assertEqual(self.run_checks("kvm, QEMU", None)["kernel isolation"].level, doctor.WARN)
+        self.assertEqual(self.run_checks(None, True)["kernel isolation"].level, doctor.WARN)
+
+    def test_there_is_exactly_one_line_about_virtualisation(self):
+        names = list(self.run_checks("kvm, QEMU", None))
+        self.assertEqual(names.count("kernel isolation"), 1)
+        self.assertNotIn("virtual machine", names)
+
+    def test_doctor_runs_without_systemd(self):
+        checks = self.run_checks(None, None, systemctl_missing=True)
+        self.assertIn("podman API socket", checks)
+        self.assertIn("tool calling", checks)  # it got all the way to the end
 
 
 if __name__ == "__main__":
