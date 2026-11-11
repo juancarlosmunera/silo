@@ -86,6 +86,9 @@ sudo sysctl --system
 ## 3. Things only you can do
 
 - Keep the kernel patched. The sandbox shares the host kernel; that is its main residual risk.
+  To put a second boundary around it, run silo in a VM with no network device
+  ([docs/LOCAL_VM.md](../docs/LOCAL_VM.md)) or on a dedicated, sealed server
+  ([docs/VPS.md](../docs/VPS.md)).
 - Keep SELinux enforcing. `silo doctor` fails the check if it is not.
 - Leave the user Podman API socket off (`systemctl --user disable --now podman.socket`) unless you
   need it: anything that can reach it controls every container you own.

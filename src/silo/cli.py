@@ -41,10 +41,12 @@ def _announce(cfg: Config) -> None:
 def cmd_doctor(cfg: Config, args) -> int:
     _announce(cfg)
     worst = 0
-    checks = doctor.run_checks(cfg)
+    egress, sealed = [], None
     if args.sealed:
         _note(f"silo[{cfg.name}] --sealed: sending connection attempts to public addresses to prove they fail")
-        checks += doctor.sealed_checks()
+        egress = doctor.sealed_checks()
+        sealed = not any(check.level == doctor.BAD for check in egress)
+    checks = doctor.run_checks(cfg, sealed=sealed) + egress
     for check in checks:
         mark = {"ok": "✓", "warn": "!", "bad": "✗"}[check.level]
         print(f" {_c(mark, STATUS_COLORS[check.level])} {check.name:<38} {check.detail}")

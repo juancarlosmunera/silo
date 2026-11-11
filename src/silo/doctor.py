@@ -64,7 +64,33 @@ def _podman_info() -> dict | None:
         return None
 
 
-def run_checks(cfg: Config) -> list[Check]:
+def kernel_isolation_check(virt: str | None, sealed: bool | None, unused_runtimes: list[str]) -> Check:
+    """What stands between a kernel exploit in the sandbox and the rest of the world.
+
+    The sandbox always shares a kernel with the machine it runs on. On a physical machine that is
+    the user's own. In a virtual machine it is the guest's, and the VM is a second boundary, but
+    only as far as the guest is sealed: `sealed` is None when that was not tested, else the result
+    of `silo doctor --sealed`.
+    """
+    name = "kernel isolation"
+    if virt is None:
+        unused = f" ({'/'.join(unused_runtimes)} is installed; silo does not use it yet)" if unused_runtimes else ""
+        return Check(name, WARN, "the sandbox shares this machine's kernel: a kernel vulnerability reachable through "
+                     f"the allowed syscalls leads to your own account{unused}",
+                     "put a second boundary around it: a VM with no network device (docs/LOCAL_VM.md) or a "
+                     "dedicated, sealed server (docs/VPS.md)")
+    if sealed:
+        return Check(name, OK, f"inside a virtual machine ({virt}) whose outbound traffic is blocked: a kernel "
+                     "exploit from the sandbox is confined to this guest")
+    if sealed is False:
+        return Check(name, WARN, f"inside a virtual machine ({virt}) that can reach the network: a kernel exploit "
+                     "from the sandbox could call out from this guest",
+                     "seal it (docs/VPS.md), or use a VM with no network device (docs/LOCAL_VM.md)")
+    return Check(name, WARN, f"inside a virtual machine ({virt}): that is a second boundary only if this machine "
+                 "is sealed and holds nothing else", "confirm with `silo doctor --sealed`")
+
+
+def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
     checks: list[Check] = []
     add = checks.append
 
@@ -83,14 +109,8 @@ def run_checks(cfg: Config) -> list[Check]:
               "" if sec.get("rootless") else "run silo as an unprivileged user"))
     runtime = host.get("ociRuntime", {}).get("name", "?")
     add(Check("OCI runtime", OK if runtime in ("crun", "runc") else WARN, runtime))
-    stronger = [name for name in ("runsc", "krun") if shutil.which(name)]
-    if stronger:
-        add(Check("kernel isolation", WARN, f"{'/'.join(stronger)} is installed but silo does not use it yet",
-                  "user-space kernel / microVM backends are on the roadmap"))
-    else:
-        add(Check("kernel isolation", WARN, "sandbox shares the host kernel: a kernel 0-day reachable through "
-                  "the allowed syscalls is the main residual risk",
-                  "keep the kernel patched; gVisor (runsc) / libkrun backends are on the roadmap"))
+    unused_runtimes = [name for name in ("runsc", "krun") if shutil.which(name)]
+    add(kernel_isolation_check(_virtualization(), sealed, unused_runtimes))
     cg = host.get("cgroupVersion")
     add(Check("cgroups", OK if cg == "v2" else BAD, f"cgroup {cg}",
               "" if cg == "v2" else "rootless resource limits require cgroup v2"))
@@ -112,8 +132,11 @@ def run_checks(cfg: Config) -> list[Check]:
         add(Check("LSM", BAD, "no SELinux/AppArmor confinement"))
 
     sock = Path(os.environ.get("XDG_RUNTIME_DIR", "/nonexistent")) / "podman" / "podman.sock"
-    active = subprocess.run(["systemctl", "--user", "is-active", "podman.socket"],
-                            capture_output=True, text=True).stdout.strip() == "active"
+    try:
+        active = subprocess.run(["systemctl", "--user", "is-active", "podman.socket"],
+                                capture_output=True, text=True, timeout=10).stdout.strip() == "active"
+    except (OSError, subprocess.TimeoutExpired):  # no systemd here: the socket file is then the only evidence
+        active = False
     if active or sock.exists():
         add(Check("podman API socket", WARN, f"user API socket is active ({sock})",
                   "systemctl --user disable --now podman.socket (whatever reaches it controls your containers)"))
@@ -199,7 +222,7 @@ def _virtualization() -> str | None:
         vendor = Path("/sys/class/dmi/id/sys_vendor").read_text().strip()
     except OSError:
         vendor = ""
-    return f"{kind} ({vendor})" if vendor else kind
+    return f"{kind}, {vendor}" if vendor else kind
 
 
 def session_checks() -> list[Check]:
@@ -219,10 +242,6 @@ def session_checks() -> list[Check]:
     elif linger is False and (remote or not graphical):
         checks.append(Check("user lingering", WARN, "off: the runtime directory, and the sandbox with it, goes "
                             "away when you log out", f"sudo loginctl enable-linger {getpass.getuser()}"))
-    virt = _virtualization()
-    if virt:
-        checks.append(Check("virtual machine", OK, f"{virt}: on a rented server, deny outbound traffic in the "
-                            "provider's firewall and confirm with `silo doctor --sealed`"))
     return checks
 
 
