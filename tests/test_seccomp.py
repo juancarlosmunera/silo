@@ -129,5 +129,104 @@ class HardenTests(unittest.TestCase):
                 self.assertTrue(rule.get("args"))
 
 
+
+MAX64 = (1 << 64) - 1
+OPS = {
+    "SCMP_CMP_EQ": lambda x, a: x == a["value"],
+    "SCMP_CMP_NE": lambda x, a: x != a["value"],
+    "SCMP_CMP_LT": lambda x, a: x < a["value"],
+    "SCMP_CMP_LE": lambda x, a: x <= a["value"],
+    "SCMP_CMP_GT": lambda x, a: x > a["value"],
+    "SCMP_CMP_GE": lambda x, a: x >= a["value"],
+    "SCMP_CMP_MASKED_EQ": lambda x, a: x & a["value"] == a["valueTwo"],
+}
+
+
+def matching(rules, args):
+    """The rules whose every condition holds for the given argument values (libseccomp semantics)."""
+    return [r for r in rules if all(OPS[c["op"]](args[c["index"]], c) for c in r["args"])]
+
+
+def samples(values):
+    """Allowed values, their neighbours, the extremes, and the same with stray upper bits."""
+    out = {0, 1, 0xFFFF, seccomp.U32, seccomp.U32 + 1, MAX64, 0x80000000}
+    for v in values:
+        out |= {v, max(v - 1, 0), min(v + 1, MAX64), v | 1 << 32, v | 1 << 63, v ^ 1, v ^ 0x80000000}
+    return sorted(out)
+
+
+class ArgumentAllowlistTests(unittest.TestCase):
+    def profile(self, **kw):
+        return seccomp.harden(FIXTURE, machine="x86_64", **kw)
+
+    def assert_partition(self, rules, allowed, args_for):
+        """Every probed call matches exactly one rule, and it allows exactly the allowlisted values."""
+        for value in samples(allowed):
+            with self.subTest(value=hex(value)):
+                hits = matching(rules, args_for(value))
+                self.assertEqual(len(hits), 1, f"{len(hits)} rules match")
+                self.assertEqual(hits[0]["action"] == "SCMP_ACT_ALLOW", value in allowed)
+
+    def test_ioctl_and_prctl(self):
+        p = self.profile()
+        self.assert_partition(rules_for(p, "ioctl"), set(seccomp.IOCTL_ALLOW), lambda v: {0: 3, 1: v, 2: 0})
+        self.assert_partition(rules_for(p, "prctl"), set(seccomp.PRCTL_ALLOW), lambda v: {0: v, 1: 0})
+
+    def test_setsockopt(self):
+        rules = rules_for(self.profile(), "setsockopt")
+        levels = set(seccomp.SETSOCKOPT_ALLOW)
+        self.assert_partition([r for r in rules if all(c["index"] == 1 for c in r["args"])] + [
+            {"action": "SCMP_ACT_ALLOW", "args": [{"index": 1, "value": lvl, "op": "SCMP_CMP_EQ"}]} for lvl in levels],
+            levels, lambda v: {1: v, 2: 0})
+        for level, names in seccomp.SETSOCKOPT_ALLOW.items():
+            with self.subTest(level=level):
+                self.assert_partition(rules, set(names), lambda v: {0: 3, 1: level, 2: v})
+        # a level outside the list is denied whatever the option
+        for optname in (2, 26, 1 << 40):
+            hits = matching(rules, {1: 0, 2: optname})
+            self.assertEqual([h["action"] for h in hits], ["SCMP_ACT_ERRNO"])
+
+    def test_known_dangerous_values_denied(self):
+        p = self.profile(action="kill")
+        cases = (("ioctl", {1: 0x5412}),            # TIOCSTI
+                 ("ioctl", {1: 0xC0306401}),        # a DRM ioctl
+                 ("prctl", {0: 35}),                # PR_SET_MM
+                 ("prctl", {0: 0x53564D41}),        # PR_SET_VMA
+                 ("prctl", {0: 59}),                # PR_SET_SYSCALL_USER_DISPATCH
+                 ("setsockopt", {1: 1, 2: 26}),     # SO_ATTACH_FILTER
+                 ("setsockopt", {1: 1, 2: 50}),     # SO_ATTACH_BPF
+                 ("setsockopt", {1: 1, 2: 42}))     # SO_PEEK_OFF
+        for name, args in cases:
+            with self.subTest(name=name, args=args):
+                hits = matching(rules_for(p, name), {0: 0, 1: 0, 2: 0, **args})
+                self.assertEqual([h["action"] for h in hits], ["SCMP_ACT_KILL_PROCESS"])
+
+    def test_measured_runtime_calls_allowed(self):
+        p = self.profile()
+        for name, args in (("ioctl", {1: 0x802C542A}), ("setsockopt", {1: 1, 2: 2}), ("setsockopt", {1: 1, 2: 20}),
+                           ("setsockopt", {1: 1, 2: 21}), ("setsockopt", {1: 6, 2: 1}),
+                           ("prctl", {0: 24}), ("prctl", {0: 8})):
+            with self.subTest(name=name, args=args):
+                hits = matching(rules_for(p, name), {0: 0, 1: 0, 2: 0, **args})
+                self.assertEqual([h["action"] for h in hits], ["SCMP_ACT_ALLOW"])
+
+    def test_gpu_sandboxes_keep_the_base_rules(self):
+        p = self.profile(cpu_only=False)
+        for name in seccomp.ARG_FILTERED:
+            self.assertFalse(any("allowlist" in r.get("comment", "") for r in rules_for(p, name)))
+
+    def test_filtered_syscalls_have_no_unconditional_rule(self):
+        for profile in (self.profile(), self.profile(action="kill")):
+            for name in seccomp.ARG_FILTERED:
+                rules = rules_for(profile, name)
+                self.assertTrue(rules)
+                for rule in rules:
+                    self.assertTrue(rule.get("args"), f"{name} has a rule without argument conditions")
+
+    def test_block_complement_rejects_wide_values(self):
+        with self.assertRaises(ValueError):
+            seccomp._blocks(2, [1, 1 << 33])
+
+
 if __name__ == "__main__":
     unittest.main()

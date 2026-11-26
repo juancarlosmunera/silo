@@ -70,6 +70,16 @@ for each entry.
 - **Exploitation primitives:** SysV and POSIX message queues, `splice`/`vmsplice`/`tee`, legacy
   AIO, `remap_file_pages`. Legitimate elsewhere, useless to llama-server, and the standard tools for
   turning a kernel bug into a working exploit.
+- **Argument allowlists (CPU-only sandboxes):** `ioctl`, `prctl` and `setsockopt` are allowed only
+  with the values an inference server uses, measured by tracing llama-server through startup,
+  model loading, buffered and streamed completions, tool calls, embeddings and concurrent requests,
+  plus the two `prctl` operations crun performs while dropping capabilities and a few read-only or
+  self-directed ones. Everything else is denied: driver-specific ioctls, `PR_SET_MM`, `PR_SET_VMA`,
+  syscall user dispatch, and classic BPF socket filters (`SO_ATTACH_FILTER`), which would otherwise
+  reach the BPF interpreter without `bpf()`. Each allowlist is written as allow rules for the exact
+  values plus deny rules that cover every other 64-bit value, and a unit test checks that the two
+  never overlap and leave nothing out. Verified by `args.*`. GPU drivers issue device ioctls that
+  cannot be listed in advance, so with GPU passthrough the stock rules for these three apply.
 - **The TTY layer:** `/dev/pts` is masked, so no pty can be allocated; line-discipline autoloading
   and `TIOCSTI` have nothing to act on.
 - **Kernel layout:** `/proc/kallsyms`, `/proc/modules`, `/proc/cmdline`, `/sys/module` and
@@ -142,8 +152,9 @@ Described in the README. The properties that matter here:
 
 Stated plainly, in rough order of importance.
 
-1. **Kernel vulnerabilities.** About 320 syscalls remain reachable, among them `ioctl`, `prctl`,
-   `mmap`, `execve` and the socket calls for `AF_UNIX`. A bug behind any of them is a way out, and
+1. **Kernel vulnerabilities.** About 320 syscalls remain reachable, among them `mmap`, `execve`, the
+   socket calls for `AF_UNIX`, and the allowlisted values of `ioctl`, `prctl` and `setsockopt`.
+   With GPU passthrough those three are not argument-filtered at all. A bug behind any of them is a way out, and
    SELinux and the user namespace are then the only things left. Use `seccomp_action = "kill"` so a
    probing exploit dies on its first denied call, keep the kernel patched, and apply the host
    sysctls. The real fix is a second boundary around the kernel. silo offers two, both outside the
@@ -192,7 +203,6 @@ Stated plainly, in rough order of importance.
 - gVisor (`runsc`) as the sandbox runtime: a second kernel boundary without a whole VM.
 - Mandatory access control for the sandbox on AppArmor hosts.
 - Handing the runtime's socket to the gateway without a shared host directory.
-- Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - Locking down `execve` after the runtime has started.
 - An origin allowlist with proper CORS handling, for browser-based clients.
 - Tool-call mediation: per-tool policy instead of all-or-nothing.

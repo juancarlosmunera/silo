@@ -15,6 +15,8 @@ compromised, so:
     bpf, perf_event_open, userfaultfd, keyrings, mount API, ptrace, process_vm_*, pidfd_getfd ...
   * none of the standard kernel-exploitation primitives an inference server has no use for:
     SysV/POSIX message queues (msg_msg spraying), splice/vmsplice/tee, legacy AIO, remap_file_pages.
+  * on CPU-only sandboxes, ioctl, prctl and setsockopt are limited to argument values an inference
+    server uses (measured on llama-server, see ARG_ALLOWLISTS): no driver ioctls, no socket filters.
 
 libseccomp detail this module depends on: an unconditional rule for a syscall silently wins over any
 argument-filtered rule for the same syscall, whatever the action or order. So a syscall that needs
@@ -149,6 +151,42 @@ CPU_ONLY_DENY: dict[str, str] = {
     "memfd_create": "fileless execution of dropped binaries",
 }
 
+# Argument allowlists, applied on CPU-only sandboxes (GPU userspace drivers issue device ioctls that
+# cannot be enumerated here). Each maps an argument index to the values allowed; everything else is
+# denied. The values are what llama-server and the probe runner (CPython) were measured using under
+# strace, plus a few read-only or self-directed operations that runtimes commonly issue.
+# Numbers are the asm-generic ones, identical on x86_64 and aarch64.
+IOCTL_ALLOW: dict[int, str] = {
+    0x5401: "TCGETS: isatty() and terminal checks (ENOTTY on anything that is not a tty)",
+    0x802C542A: "TCGETS2: isatty() in newer glibc",
+    0x5413: "TIOCGWINSZ: terminal size queries",
+    0x541B: "FIONREAD: bytes waiting on a socket or pipe",
+    0x5421: "FIONBIO: non-blocking mode, handled generically in fs/ioctl.c",
+    0x5450: "FIONCLEX: close-on-exec off, generic",
+    0x5451: "FIOCLEX: close-on-exec on, generic (CPython's set_inheritable)",
+}
+PRCTL_ALLOW: dict[int, str] = {
+    # crun runs these after loading the filter, while it drops capabilities before exec. Both only
+    # shed privilege: the bounding set can only shrink, and KEEPCAPS matters for setuid transitions,
+    # which no_new_privs and the empty capability set already rule out.
+    24: "PR_CAPBSET_DROP (crun)", 8: "PR_SET_KEEPCAPS (crun)",
+    1: "PR_SET_PDEATHSIG", 2: "PR_GET_PDEATHSIG", 3: "PR_GET_DUMPABLE",
+    15: "PR_SET_NAME: thread names", 16: "PR_GET_NAME",
+    21: "PR_GET_SECCOMP", 23: "PR_CAPBSET_READ", 30: "PR_GET_TIMERSLACK", 37: "PR_GET_CHILD_SUBREAPER",
+    38: "PR_SET_NO_NEW_PRIVS (can only tighten)", 39: "PR_GET_NO_NEW_PRIVS", 42: "PR_GET_THP_DISABLE",
+    52: "PR_GET_SPECULATION_CTRL",
+}
+SOL_SOCKET, IPPROTO_TCP = 1, 6
+SETSOCKOPT_ALLOW: dict[int, dict[int, str]] = {
+    SOL_SOCKET: {
+        2: "SO_REUSEADDR (llama-server's listener)", 7: "SO_SNDBUF", 8: "SO_RCVBUF", 9: "SO_KEEPALIVE",
+        13: "SO_LINGER", 20: "SO_RCVTIMEO_OLD (llama-server)", 21: "SO_SNDTIMEO_OLD (llama-server)",
+        66: "SO_RCVTIMEO_NEW", 67: "SO_SNDTIMEO_NEW",
+    },
+    IPPROTO_TCP: {1: "TCP_NODELAY (llama-server sets it; on AF_UNIX the kernel answers EOPNOTSUPP)"},
+}
+ARG_FILTERED = {"ioctl", "prctl", "setsockopt"}
+
 # Removed from the base profile and re-added below with silo's own argument conditions.
 REPLACED = {"socket", "socketpair", "clone"}
 
@@ -161,6 +199,77 @@ def _deny(action: str, errno: int) -> dict:
 
 def _arg(index: int, value: int, op: str, value_two: int = 0) -> dict:
     return {"index": index, "value": value, "valueTwo": value_two, "op": op}
+
+
+U32 = 0xFFFFFFFF
+
+
+def _gaps(index: int, values) -> list[list[dict]]:
+    """Conditions that together match every 64-bit value of one argument except `values`.
+
+    One rule per gap between consecutive allowed values (two comparisons on the same argument), so
+    the allow rules (equality) and these deny rules are disjoint and, between them, exhaustive. A
+    value with stray upper bits never equals an allowed one and falls into the last gap: denied.
+    """
+    vals = sorted(set(values))
+    gaps = [[_arg(index, vals[0], "SCMP_CMP_LT")]] if vals[0] > 0 else []
+    for low, high in zip(vals, vals[1:]):
+        if high - low > 1:
+            gaps.append([_arg(index, low, "SCMP_CMP_GT"), _arg(index, high, "SCMP_CMP_LT")])
+    if vals[-1] < (1 << 64) - 1:
+        gaps.append([_arg(index, vals[-1], "SCMP_CMP_GT")])
+    return gaps
+
+
+def _blocks(index: int, values) -> list[list[dict]]:
+    """Like `_gaps`, with one comparison per rule, for rules that already compare another argument.
+
+    libseccomp 2.6 refuses (EEXIST) several two-comparison range rules behind a shared condition on
+    another argument, so there the complement is written as aligned bit-prefix blocks of the low 32
+    bits (masked equality, like CIDR blocks), plus one rule for any value with upper bits set.
+    """
+    vals = sorted(set(values))
+    if any(v > U32 for v in vals):
+        raise ValueError("block allowlists cover 32-bit values")
+    if len(vals) == 1:
+        return [[_arg(index, vals[0], "SCMP_CMP_NE")]]
+    out = [[_arg(index, U32, "SCMP_CMP_GT")]]
+
+    def walk(depth: int, prefix: int, members: list[int]) -> None:
+        if not members:
+            mask = (((1 << depth) - 1) << (32 - depth)) | (U32 << 32)
+            out.append([_arg(index, mask, "SCMP_CMP_MASKED_EQ", prefix)])
+            return
+        if depth == 32:
+            return
+        bit = 31 - depth
+        walk(depth + 1, prefix, [v for v in members if not v >> bit & 1])
+        walk(depth + 1, prefix | 1 << bit, [v for v in members if v >> bit & 1])
+
+    walk(0, 0, vals)
+    return out
+
+
+def _allowlist_rules(name: str, index: int, values, deny: dict, prefix: tuple = (), label: str = "") -> list[dict]:
+    allow = [{"names": [name], "action": "SCMP_ACT_ALLOW", "args": [*prefix, _arg(index, v, "SCMP_CMP_EQ")],
+              "comment": f"silo: {name}{label} allowlist"} for v in sorted(values)]
+    complement = _blocks(index, values) if prefix else _gaps(index, values)
+    denied = [{"names": [name], **deny, "args": [*prefix, *gap], "comment": f"silo: {name}{label} not allowlisted"}
+              for gap in complement]
+    return allow + denied
+
+
+def argument_rules(action: str) -> list[dict]:
+    """The ioctl / prctl / setsockopt rules for a CPU-only sandbox."""
+    deny = _deny(action, EPERM)
+    rules = _allowlist_rules("ioctl", 1, IOCTL_ALLOW, deny)
+    rules += _allowlist_rules("prctl", 0, PRCTL_ALLOW, deny)
+    rules += [{"names": ["setsockopt"], **deny, "args": gap, "comment": "silo: setsockopt level not allowlisted"}
+              for gap in _gaps(1, SETSOCKOPT_ALLOW)]
+    for level, names in SETSOCKOPT_ALLOW.items():
+        rules += _allowlist_rules("setsockopt", 2, names, deny, prefix=(_arg(1, level, "SCMP_CMP_EQ"),),
+                                  label=f" level {level}")
+    return rules
 
 
 def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_only: bool = True) -> dict:
@@ -181,7 +290,7 @@ def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_on
     profile["defaultErrnoRet"] = ENOSYS
 
     deny = dict(DENY, **(CPU_ONLY_DENY if cpu_only else {}))
-    strip = set(deny) | set(FORCE_ENOSYS) | REPLACED
+    strip = set(deny) | set(FORCE_ENOSYS) | REPLACED | (ARG_FILTERED if cpu_only else set())
     rules = []
     for rule in profile.get("syscalls", []):
         names = [n for n in rule.get("names", []) if n not in strip]
@@ -216,6 +325,8 @@ def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_on
             "args": [_arg(0, bit, "SCMP_CMP_MASKED_EQ", bit)],
             "comment": f"silo: clone with {flag_name}",
         })
+    if cpu_only:
+        rules.extend(argument_rules(action))
     rules.append({
         "names": sorted(deny),
         **_deny(action, EPERM),

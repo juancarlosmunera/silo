@@ -359,7 +359,8 @@ def probe(cfg: Config, baseline: bool = False) -> tuple[int, list[dict]]:
         if cfg.model.dir and cfg.model.dir.is_dir():
             mounts.insert(0, sandbox.Mount(cfg.model.dir, "/models", shared_label=True))
         args = sandbox.podman_run_args(
-            cfg, name=f"{cfg.container_name}-probe", image=image, command=["python3", "-I", "-"],
+            cfg, name=f"{cfg.container_name}-probe", image=image,
+            command=["python3", "-I", "-", *(["--gpu"] if cfg.runtime.gpu != "none" else [])],
             seccomp_profile=profile, mounts=mounts, interactive=True, memory="512m", gpu=cfg.runtime.gpu,
         )
     try:

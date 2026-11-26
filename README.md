@@ -58,7 +58,7 @@ first item under [Limits](#limits).
 | Way out | Control |
 |---|---|
 | **Network** | `--network=none`: a private loopback, no routes, no resolver. Independently, seccomp allows `socket()` and `socketpair()` for `AF_UNIX` only and denies the ways around that filter: io_uring, `socketcall`, and the 32-bit and x32 syscall ABIs. Optionally, a host firewall rule drops everything the sandbox user originates ([host/](host/README.md)). |
-| **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. |
+| **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. On CPU-only sandboxes, `ioctl`, `prctl` and `setsockopt` are limited to the argument values an inference server uses, measured on llama-server: no driver ioctls, no socket filters. |
 | **Privilege** | Rootless Podman, so container root is not host root. The runtime runs as `nobody`, mapped to a subordinate UID that owns nothing on the host. Every capability dropped, bounding set included. `no-new-privileges`. SELinux `container_t` with per-container categories. |
 | **Filesystem, persistence** | Read-only root. Model directory mounted read-only. The only writable location is a 64 MB `noexec` tmpfs. No `memfd_create` on CPU-only sandboxes, so no fileless exec either. Environment stripped. No Podman, D-Bus, display, audio or agent sockets visible. |
 | **The shared socket directory** | The one host directory the sandbox can touch is locked within about a millisecond of the runtime binding its socket. From then on the sandbox cannot fill it or swap the socket for a symlink to another host socket, and anything found in it besides that socket fails the launch. |
@@ -73,15 +73,15 @@ The reasoning behind each control, and what is left over, is in
 ## Check it yourself
 
 None of the above is taken on trust. `silo probe` starts a sandbox with exactly the flags the model
-gets and runs 66 probes inside it: reach the network through a dozen socket types, create
-namespaces, call the kernel interfaces listed above, find a location that is both writable and
+gets and runs 72 probes inside it: reach the network through a dozen socket types, create
+namespaces, call the kernel interfaces listed above, use syscall arguments outside the allowlists, find a location that is both writable and
 executable, find host sockets and credentials, and check the process's own privileges and limits.
 `silo probe --baseline` runs the same probes in a stock rootless Podman container.
 
 | | stock rootless Podman | silo |
 |---|---|---|
-| contained (PASS) | 26 | 66 |
-| not contained (FAIL) | 31 | 0 |
+| contained (PASS) | 27 | 72 |
+| not contained (FAIL) | 36 | 0 |
 | weaker than intended (WARN) | 7 | 0 |
 
 These are the numbers from the development machine. Two probes are skipped in the baseline because
@@ -168,7 +168,7 @@ silo probe      # run the escape probes in a sandbox identical to the model's
  PASS sys.unshare                    unshare(CLONE_NEWUSER): refused (EPERM)
  PASS fs.writable_noexec             writable locations ['/tmp'] are all noexec
  ...
-PASS=66  FAIL=0  WARN=0  SKIP=0
+PASS=72  FAIL=0  WARN=0  SKIP=0
 ```
 
 **4. Start it.**
@@ -341,7 +341,6 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 - A lighter second kernel boundary than a full VM: gVisor as the sandbox runtime.
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
 - Handing the runtime's socket to the gateway without a shared host directory.
-- Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - An origin allowlist with proper CORS handling, for browser-based clients.
 - Per-tool policy for tool calling, in place of all-or-nothing.
 - Verification on GPU hardware, aarch64 and hosts without SELinux.

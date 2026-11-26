@@ -71,6 +71,11 @@ def cmd_seccomp(cfg: Config, args) -> int:
     print(f"unconditionally allowed: {len(before)} -> {len(after)} syscalls")
     print(f"removed from the stock allowlist ({len(removed)}): {', '.join(removed)}")
     print("socket()/socketpair(): AF_UNIX only · clone(): no namespace flags · clone3(): ENOSYS")
+    if cfg.runtime.gpu == "none":
+        print(f"argument allowlists: ioctl ({len(seccomp.IOCTL_ALLOW)} requests), prctl ({len(seccomp.PRCTL_ALLOW)} "
+              f"options), setsockopt ({sum(map(len, seccomp.SETSOCKOPT_ALLOW.values()))} options)")
+    else:
+        print("argument allowlists: off (GPU passthrough needs device ioctls)")
     print(f"deny action: {cfg.runtime.seccomp_action}")
     return 0
 
