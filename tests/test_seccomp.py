@@ -231,7 +231,8 @@ class ArgumentAllowlistTests(unittest.TestCase):
         p = self.profile()
         for name, args in (("ioctl", {1: 0x802C542A}), ("setsockopt", {1: 1, 2: 2}), ("setsockopt", {1: 1, 2: 20}),
                            ("setsockopt", {1: 1, 2: 21}), ("setsockopt", {1: 6, 2: 1}),
-                           ("prctl", {0: 24}), ("prctl", {0: 8})):
+                           ("prctl", {0: 24}), ("prctl", {0: 8}),
+                           ("prctl", {0: 51})):  # PR_SVE_GET_VL: what llama-server asks on aarch64
             with self.subTest(name=name, args=args):
                 hits = matching(rules_for(p, name), {0: 0, 1: 0, 2: 0, **args})
                 self.assertEqual([h["action"] for h in hits], ["SCMP_ACT_ALLOW"])
