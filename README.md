@@ -22,7 +22,8 @@ the gateway exists to narrow and record it.
 
 > **Status: 0.1, early.** Verified on Fedora 43 (SELinux enforcing) with rootless Podman 5.6 and
 > 5.8, x86_64, CPU inference, running llama.cpp's server. Also exercised on Ubuntu 24.04, where one
-> layer is missing ([details](docs/VPS.md#other-distributions)). Not yet verified: GPU passthrough,
+> layer is missing ([details](docs/VPS.md#other-distributions)). GPU passthrough verified on an
+> Intel GPU (`gpu = "dri"`, llama.cpp's Vulkan image). Not yet verified: NVIDIA and AMD GPUs,
 > aarch64. silo lowers risk; it is not a guarantee. Read [Limits](#limits) before relying on it.
 
 **Contents:** [Isn't a container enough?](#isnt-a-container-enough) ·
@@ -292,7 +293,7 @@ The settings that matter most. Every option, with comments, is in
 | `runtime.exec_lock` | `true` | After the runtime has started, refuse every `execve` in the sandbox. Turn it off only for an image whose entrypoint is a wrapper that starts the real server. |
 | `runtime.runsc` | none | Path to gVisor's `runsc`: run the sandbox on gVisor's user-space kernel. See [docs/GVISOR.md](docs/GVISOR.md). |
 | `runtime.gvisor_platform` | `"systrap"` | With `runsc`: `"systrap"` works everywhere, `"kvm"` is faster and hands `/dev/kvm` to gVisor. |
-| `runtime.gpu` | `"none"` | GPU passthrough. Exposes a GPU driver to the sandbox and is not yet verified. |
+| `runtime.gpu` | `"none"` | GPU passthrough: `"dri"` (Vulkan: Intel, AMD), `"amd"` (ROCm), `"nvidia"` (CDI). Exposes a GPU driver to the sandbox; DRM GPUs get their render nodes only. Verified with `"dri"` on Intel. |
 | `gateway.listen`, `gateway.port` | `127.0.0.1`, `8088` | A non-loopback address is refused unless `api_key_env` is set. |
 | `gateway.scanner` | `"monitor"` | `"off"`, `"monitor"` (log and alert) or `"enforce"` (withhold high-severity completions). |
 | `gateway.allow_tools` | `false` | Tool calling. When on, whatever executes the calls is outside the silo. |
@@ -370,14 +371,14 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
   that is where containment now has to hold.
 - **Loopback is shared.** Any process on the machine can talk to the gateway unless you set an API
   key.
-- **GPU passthrough** exposes a large driver to the sandbox and is unverified.
+- **GPU passthrough** exposes a large driver to the sandbox. It is verified on an Intel GPU only.
 - **Covert channels** (timing, load) are out of scope.
 
 ## Roadmap
 
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
-- Verification on GPU hardware, aarch64 and hosts without SELinux.
+- Verification on NVIDIA and AMD GPUs, aarch64 and hosts without SELinux.
 
 ## Development
 

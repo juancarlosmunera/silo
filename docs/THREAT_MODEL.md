@@ -242,8 +242,10 @@ Stated plainly, in rough order of importance.
    machine can reach. Set `api_key_env` if that matters. The model socket itself is reachable only
    by your user.
 5. **GPU passthrough.** A GPU driver is a large, privileged kernel interface handed to the
-   sandbox, and `memfd_create` stays allowed for it. The code path exists and has not been run on
-   real hardware. For a model you do not trust, use the CPU.
+   sandbox, and `memfd_create` stays allowed for it. With `dri` or `amd`, only the render nodes
+   are passed: the display nodes (`/dev/dri/card*`), which carry modesetting, never are. Verified
+   on an Intel Iris Xe GPU with llama.cpp's Vulkan image in kill mode: the Vulkan driver needed no
+   syscall silo denies. NVIDIA and AMD are not verified. For a model you do not trust, use the CPU.
 6. **Covert channels.** Timing, CPU load and memory pressure can carry bits to a cooperating
    process outside. Containers do not address this and neither does silo.
 7. **Information visible inside.** Kernel version, CPU details, memory size and the host path of
@@ -272,4 +274,4 @@ Stated plainly, in rough order of importance.
 
 - Mandatory access control for the sandbox on AppArmor hosts.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
-- The probe suite as a CI gate, and verification on GPU hardware and aarch64.
+- The probe suite as a CI gate, and verification on NVIDIA and AMD GPUs and on aarch64.
