@@ -217,7 +217,7 @@ journalctl --user -u silo -f                   # startup, and the gateway's aler
 ```
 
 With lingering enabled in step 2, the service starts at boot without anyone logging in. Stopping
-it removes the container and the socket directory.
+it removes the container and the runtime directory.
 
 ## 7. Use it
 

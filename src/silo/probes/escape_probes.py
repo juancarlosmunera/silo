@@ -355,21 +355,23 @@ def probe_readonly():
 
 
 def probe_socket_dir():
-    # The one host directory shared with the sandbox. silo locks it (0755, owned by the host user)
-    # once the runtime has bound its socket, so the sandbox can neither fill the host tmpfs nor swap
-    # the socket for a symlink to some other host socket.
-    if not os.path.isdir("/run/silo"):
-        return record("fs.socket_dir_locked", "SKIP", "/run/silo not mounted")
-    err = try_write("/run/silo/silo-probe")
-    if err is None:
-        return record("fs.socket_dir_locked", "FAIL", "sandbox can create files in the shared socket directory")
+    # The runtime answers on an abstract UNIX socket inside its own network namespace; the gateway
+    # reaches it through silo's connector. No host directory is mounted into the sandbox writable.
+    host_mounts = []
     try:
-        os.symlink("/run/silo/elsewhere", "/run/silo/llama.sock")
-        os.unlink("/run/silo/llama.sock")
-        return record("fs.socket_dir_locked", "FAIL", "sandbox can plant a symlink at the socket path")
-    except OSError:
-        pass
-    record("fs.socket_dir_locked", "PASS", f"shared socket directory is not writable ({err.strerror})")
+        with open("/proc/self/mountinfo") as fh:
+            for line in fh:
+                fields = line.split()
+                target, opts = fields[4], fields[5].split(",")
+                fstype = fields[fields.index("-") + 1] if "-" in fields else ""
+                if ("rw" in opts and target not in EXPECTED_RW_MOUNTS
+                        and fstype not in ("tmpfs", "proc", "sysfs", "cgroup2", "devpts", "mqueue")):
+                    host_mounts.append(target)
+    except (OSError, IndexError, ValueError) as exc:
+        return record("fs.no_shared_dir", "WARN", f"cannot read the mount table ({exc})")
+    if host_mounts:
+        return record("fs.no_shared_dir", "FAIL", f"host directories mounted writable: {host_mounts}")
+    record("fs.no_shared_dir", "PASS", "no host directory is mounted writable (the runtime socket is abstract)")
 
 
 def writable_dirs():
@@ -444,7 +446,7 @@ def probe_memfd_exec():
     record("fs.memfd_exec", "PASS", f"{outcome.replace('_', ' ')} ({info})")
 
 
-EXPECTED_RW_MOUNTS = {"/tmp", "/run/silo", "/dev", "/dev/shm", "/dev/pts", "/dev/mqueue", "/proc",
+EXPECTED_RW_MOUNTS = {"/tmp", "/dev", "/dev/shm", "/dev/pts", "/dev/mqueue", "/proc",
                       "/sys/fs/cgroup", "/run/.containerenv", "/etc/hostname", "/etc/resolv.conf",
                       # rootless podman cannot mknod, so these are bind mounts of the host's nodes
                       "/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/random", "/dev/urandom",

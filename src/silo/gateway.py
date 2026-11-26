@@ -2,8 +2,9 @@
 
     client --HTTP/127.0.0.1--> gateway --HTTP over AF_UNIX--> llama-server (network=none)
 
-The model process cannot initiate anything: it has no network interface and can only answer on its
-UNIX socket. The gateway treats both sides as untrusted and terminates the protocol rather than
+The model process cannot initiate anything: it has no network interface and can only answer on an
+abstract UNIX socket inside its own network namespace, which the gateway reaches through the
+connector (silo.connector) without any directory shared with the sandbox. The gateway treats both sides as untrusted and terminates the protocol rather than
 piping bytes:
 
   * route allowlist (OpenAI-compatible inference endpoints + /health), matched verbatim; no admin,
@@ -32,7 +33,6 @@ import ipaddress
 import json
 import os
 import socket
-import stat
 import sys
 import threading
 import time
@@ -40,7 +40,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from silo import scanner
+from silo import connector, hostrules, scanner
 from silo.config import Config, ConfigError
 
 ROUTES: dict[str, set[str]] = {
@@ -74,26 +74,14 @@ class ClientGone(Exception):
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, path: str, timeout: float):
+    """HTTP to the runtime over a socket handed over by the connector at `control`."""
+
+    def __init__(self, control: str, timeout: float, expect_uid: int | None = None):
         super().__init__("localhost", timeout=timeout)
-        self._unix_path = path
+        self._control, self._expect_uid = control, expect_uid
 
     def connect(self) -> None:
-        # lstat, not stat: the path must itself be a socket, never a symlink to some other host socket.
-        try:
-            mode = os.lstat(self._unix_path).st_mode
-        except OSError as exc:
-            raise FileNotFoundError(self._unix_path) from exc
-        if not stat.S_ISSOCK(mode):
-            raise ConnectionRefusedError(f"{self._unix_path} is not a socket")
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        try:
-            sock.connect(self._unix_path)
-        except OSError:
-            sock.close()
-            raise
-        self.sock = sock
+        self.sock = connector.dial(self._control, self.timeout, self._expect_uid)
 
 
 class AuditLog:
@@ -149,10 +137,13 @@ class _Server(ThreadingHTTPServer):
 
 
 class Gateway:
-    def __init__(self, cfg: Config, socket_path: Path | None = None, audit: AuditLog | None = None):
+    def __init__(self, cfg: Config, control_path: Path | None = None, audit: AuditLog | None = None,
+                 expect_uid: int | None | bool = True):
         self.cfg = cfg
         self.gw = cfg.gateway
-        self.socket_path = str(socket_path or cfg.socket_path)
+        self.control_path = str(control_path or cfg.control_path)
+        # The sandbox's host UID, checked on every connection the connector hands over.
+        self.expect_uid = sandbox_uid() if expect_uid is True else expect_uid
         self.audit = audit or AuditLog(cfg.audit_log)
         self.slots = threading.BoundedSemaphore(self.gw.max_concurrency)
         self.loopback_only = ipaddress.ip_address(self.gw.listen).is_loopback
@@ -356,7 +347,7 @@ def _make_handler(gw: Gateway):
 
         def _proxy(self, method: str, path: str, body: bytes, stream: bool, entry: dict) -> None:
             deadline = self._t0 + cfg.timeout
-            conn = UnixHTTPConnection(gw.socket_path, timeout=cfg.timeout)
+            conn = UnixHTTPConnection(gw.control_path, timeout=cfg.timeout, expect_uid=gw.expect_uid)
             try:
                 headers = {"Accept": JSON_TYPE}
                 if method == "POST":
@@ -487,12 +478,19 @@ def _make_handler(gw: Gateway):
     return Handler
 
 
-def serve(cfg: Config, socket_path: Path | None = None) -> None:
-    gw = Gateway(cfg, socket_path)
+def sandbox_uid() -> int:
+    try:
+        return hostrules.sandbox_host_uid(hostrules.subuid_ranges())
+    except hostrules.HostRuleError as exc:
+        raise ConfigError(f"cannot work out the sandbox's host UID: {exc}") from exc
+
+
+def serve(cfg: Config) -> None:
+    gw = Gateway(cfg)
     srv = gw.server()
     host, port = srv.server_address[:2]
     shown = f"[{host}]" if ":" in host else host
-    print(f"silo[{cfg.name}] gateway on http://{shown}:{port}/v1  ->  {gw.socket_path}", file=sys.stderr)
+    print(f"silo[{cfg.name}] gateway on http://{shown}:{port}/v1  ->  {gw.control_path} (connector)", file=sys.stderr)
     print(f"silo[{cfg.name}] scanner={cfg.gateway.scanner} tools={'allowed' if cfg.gateway.allow_tools else 'refused'}"
           f" audit={gw.audit.path}", file=sys.stderr, flush=True)
     try:

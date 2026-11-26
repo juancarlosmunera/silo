@@ -3,7 +3,7 @@
 # Unknown keys and wrong types are errors. Everything except [model] has a default.
 
 [silo]
-# Names the container (silo-<name>), the socket directory, the manifest and the audit log.
+# Names the container (silo-<name>), the runtime directory, the manifest and the audit log.
 name = "default"
 
 [model]

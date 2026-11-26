@@ -110,8 +110,16 @@ class Config:
         return runtime_root() / self.name
 
     @property
-    def socket_path(self) -> Path:
-        return self.socket_dir / "llama.sock"
+    def control_path(self) -> Path:
+        return self.socket_dir / "control.sock"
+
+    @property
+    def connector_pidfile(self) -> Path:
+        return self.socket_dir / "connector.pid"
+
+    @property
+    def connector_log(self) -> Path:
+        return self.socket_dir / "connector.log"
 
     @property
     def audit_log(self) -> Path:

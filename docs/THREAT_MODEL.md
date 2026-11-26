@@ -28,7 +28,7 @@ What has to be correct for the above to hold:
 
 - the host kernel (namespaces, seccomp, cgroups, SELinux enforcement);
 - Podman, crun and conmon, and the SELinux container policy;
-- silo's launcher and gateway: about 1,400 lines of Python (`sandbox.py`, `seccomp.py`, `runtime.py`,
+- silo's launcher, connector and gateway: about 1,500 lines of Python (`sandbox.py`, `seccomp.py`, `runtime.py`, `connector.py`,
   `gateway.py`), standard library only;
 - the base seccomp profile shipped by the distribution, which silo tightens but does not replace;
 - `silo.toml`, which chooses the image, the model directory and the seccomp base. It is read only
@@ -99,20 +99,23 @@ emptied. Verified by `fs.*`, `proc.environment`, `host.secrets`.
 `noexec` raises the cost of running a dropped binary; it does not stop code execution inside an
 already compromised process, which can still map executable memory.
 
-### The socket directory
+### The runtime's socket
 
-The runtime has to create a UNIX socket that the gateway can reach, so one host directory is
-shared with the sandbox. It sits inside a 0700 directory in `$XDG_RUNTIME_DIR` and starts out
-writable for the sandbox UID. A watcher thread, started before the container, makes it read-only
-for that UID as soon as anything appears in it, and then checks that it holds exactly one entry, a
-socket (by `lstat`, so a symlink to some other host socket is refused). Anything else aborts the
-launch. silo does not connect to the socket before that check has passed, and the gateway repeats
-the `lstat` check on every connection. Verified by `fs.socket_dir_locked`.
+The gateway has to reach the runtime, but no host directory is shared with the sandbox for it.
+llama-server listens on an abstract UNIX socket. Abstract sockets belong to a network namespace,
+not to the filesystem, so this one exists only inside the sandbox's `--network=none` namespace:
+no host process can see it, and the sandbox gets nothing on the host to write to.
 
-The lock cannot land before model loading: llama-server binds and goes straight on to read the
-model file. Measured from inode timestamps on the development machine it lands about a millisecond
-after the bind, which is the resolution of those timestamps. See the startup window under residual
-risk.
+To reach it, silo starts a connector (`silo/connector.py`, about 170 lines, standard library) under
+`podman unshare`, as root of the rootless user namespace that owns the container's namespaces. It
+binds a control socket (0600, in the 0700 runtime directory in `$XDG_RUNTIME_DIR`), joins the
+container's network namespace after checking it is not its own, and drops to an unprivileged UID of
+the user namespace, which leaves it with no capabilities. From then on it only does this, on
+request: connect to the runtime's abstract socket and pass the connected socket to the gateway over
+the control socket. It never reads what the runtime sends, and it exits when the container's
+process does. The gateway checks that the control socket is a socket owned by the user (`lstat`, so
+not a symlink) and, on every connection, that the peer is the sandbox's host UID (`SO_PEERCRED`).
+Verified by `fs.no_shared_dir`; the connector's state is shown by `silo status`.
 
 ### Model files
 
@@ -172,12 +175,7 @@ Stated plainly, in rough order of importance.
    the sandbox process is not confined by any mandatory access control. Everything else is in
    place there, but the layer that limits what a process can touch once it is past the others is
    missing. `silo doctor` fails such a host and `silo probe` reports it.
-10. **The startup window.** From container start until about a millisecond after the socket is
-   bound, the socket directory is writable by the sandbox UID. Model loading begins right after the
-   bind, so its first instants fall inside that window. A model file that exploits the loader that
-   quickly could write there: what it leaves behind fails the launch, but a brief fill of the
-   runtime tmpfs is possible. The fix is not to share a directory at all.
-11. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
+10. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
     delivered. Only `enforce` withholds.
 
 ## Not goals
@@ -191,7 +189,6 @@ Stated plainly, in rough order of importance.
 
 - gVisor (`runsc`) as the sandbox runtime: a second kernel boundary without a whole VM.
 - Mandatory access control for the sandbox on AppArmor hosts.
-- Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - Locking down `execve` after the runtime has started.
 - An origin allowlist with proper CORS handling, for browser-based clients.

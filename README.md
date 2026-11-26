@@ -61,7 +61,7 @@ first item under [Limits](#limits).
 | **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. |
 | **Privilege** | Rootless Podman, so container root is not host root. The runtime runs as `nobody`, mapped to a subordinate UID that owns nothing on the host. Every capability dropped, bounding set included. `no-new-privileges`. SELinux `container_t` with per-container categories. |
 | **Filesystem, persistence** | Read-only root. Model directory mounted read-only. The only writable location is a 64 MB `noexec` tmpfs. No `memfd_create` on CPU-only sandboxes, so no fileless exec either. Environment stripped. No Podman, D-Bus, display, audio or agent sockets visible. |
-| **The shared socket directory** | The one host directory the sandbox can touch is locked within about a millisecond of the runtime binding its socket. From then on the sandbox cannot fill it or swap the socket for a symlink to another host socket, and anything found in it besides that socket fails the launch. |
+| **The runtime's socket** | No host directory is shared with the sandbox. llama-server listens on an abstract UNIX socket, which exists only inside its own network namespace; a small connector started through `podman unshare` joins that namespace, drops every capability and hands each connection to the gateway, which checks the peer is the sandbox's UID. |
 | **Resources** | Memory cap with no swap, PID cap, file-descriptor cap, size-capped log. |
 | **Model files** | `silo intake`: format allowlist (GGUF, safetensors), magic-byte checks, no pickles, code or symlinks, and a SHA-256 manifest kept outside the model directory and checked before every launch. |
 | **The runtime's own features** | llama-server flags that add listeners, downloads, tools, agents, MCP or remote backends are refused. Web UI, slots and the MCP proxy are switched off. Images are never pulled at launch. |
@@ -180,8 +180,8 @@ silo up
 ```
 silo[default] config: /home/you/.config/silo/silo.toml
 silo[default] starting silo-default from ghcr.io/ggml-org/llama.cpp:server
-silo[default] model healthy on /run/user/1000/silo/default/llama.sock (socket directory locked)
-silo[default] gateway on http://127.0.0.1:8088/v1  ->  /run/user/1000/silo/default/llama.sock
+silo[default] model healthy, reached through /run/user/1000/silo/default/control.sock (connector; no shared directory)
+silo[default] gateway on http://127.0.0.1:8088/v1  ->  /run/user/1000/silo/default/control.sock (connector)
 silo[default] scanner=monitor tools=refused audit=/home/you/.local/state/silo/audit/default.jsonl
 ```
 
@@ -206,7 +206,7 @@ print(reply.choices[0].message.content)
 Streaming works the same way. Browser-based clients are refused: any request that carries an
 `Origin` header is.
 
-Ctrl-C stops the gateway and the sandbox and removes the socket directory.
+Ctrl-C stops the gateway, the sandbox and the connector.
 
 ## On a VPS
 
@@ -340,7 +340,6 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 
 - A lighter second kernel boundary than a full VM: gVisor as the sandbox runtime.
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
-- Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - An origin allowlist with proper CORS handling, for browser-based clients.
 - Per-tool policy for tool calling, in place of all-or-nothing.
