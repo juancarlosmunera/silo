@@ -84,6 +84,18 @@ class ConfigTests(unittest.TestCase):
         os.chmod(tmp, dir_mode)
         return path
 
+    def nested_runsc(self):
+        """runsc in a sound directory, one level below a directory that anyone can write to (and is not sticky)."""
+        open_dir = tempfile.mkdtemp(dir="/var/tmp")
+        self.addCleanup(shutil.rmtree, open_dir, ignore_errors=True)
+        inner = Path(open_dir) / "gvisor"
+        inner.mkdir(mode=0o755)
+        path = inner / "runsc"
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+        os.chmod(open_dir, 0o777)
+        return path
+
     def test_gvisor(self):
         path = self.runsc()
         cfg = config.load(write(f'[runtime]\nrunsc = "{path}"\n'))
@@ -100,6 +112,7 @@ class ConfigTests(unittest.TestCase):
             "not executable": f'[runtime]\nrunsc = "{self.runsc(mode=0o644)}"\n',
             "replaceable by others": f'[runtime]\nrunsc = "{self.runsc(mode=0o777)}"\n',
             "in a directory others can write to": f'[runtime]\nrunsc = "{self.runsc(dir_mode=0o777)}"\n',
+            "below a directory others can write to": f'[runtime]\nrunsc = "{self.nested_runsc()}"\n',
             "not reachable by the sandbox UID (file)": f'[runtime]\nrunsc = "{self.runsc(mode=0o750)}"\n',
             "not reachable by the sandbox UID (directory)": f'[runtime]\nrunsc = "{self.runsc(dir_mode=0o700)}"\n',
             "with a GPU": f'[runtime]\nrunsc = "{good}"\ngpu = "dri"\n',
