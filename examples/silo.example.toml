@@ -58,6 +58,11 @@ scanner = "monitor"
 # false: requests that carry tools/functions are refused and tool calls from the model are cut off.
 # true: whatever executes those tool calls is outside the silo and becomes your boundary.
 allow_tools = false
+# With allow_tools = true: the only tool names a request may offer (empty = any). The model can only
+# call a tool the request offered, whatever this list says.
+# tools = ["read_file", "search_docs"]
+# Cap on the arguments of each tool call the model makes, in bytes.
+max_tool_arguments_bytes = 32768
 # Write prompts and completions into the audit log. Off by default: hashes and findings only.
 log_content = false
 max_request_bytes = 1048576
@@ -65,5 +70,9 @@ max_response_bytes = 16777216
 # Total seconds per request, from connect to last byte.
 timeout = 600.0
 max_concurrency = 4
+# Browser-based clients: the exact origins (scheme://host[:port], as the browser sends them) allowed to
+# call the gateway. Requests from any other page are refused. Any script on a listed page can use the
+# model, so set api_key_env as well.
+# allowed_origins = ["http://localhost:3000"]
 # Required for a non-loopback listen address: name of an environment variable holding a bearer token.
 # api_key_env = "SILO_API_KEY"

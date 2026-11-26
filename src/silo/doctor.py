@@ -261,11 +261,21 @@ def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
         add(Check("output scanner", WARN, f"{cfg.gateway.scanner}: suspicious completions are "
                   f"{'logged but not' if cfg.gateway.scanner == 'monitor' else 'neither logged nor'} blocked",
                   'gateway.scanner = "enforce" (streams are then delivered only once complete)'))
-    if cfg.gateway.allow_tools:
-        add(Check("tool calling", WARN, "allowed: whatever executes the model's tool calls is outside the silo",
-                  "that executor is now your containment boundary; sandbox it too"))
+    if cfg.gateway.allow_tools and cfg.gateway.tools:
+        add(Check("tool calling", WARN, f"allowed for {', '.join(cfg.gateway.tools)}: whatever executes those calls "
+                  "is outside the silo", "that executor is now your containment boundary; sandbox it too"))
+    elif cfg.gateway.allow_tools:
+        add(Check("tool calling", WARN, "allowed for any tool a client offers: whatever executes the model's tool "
+                  "calls is outside the silo", "list the tools you mean to allow in gateway.tools, and sandbox "
+                  "their executor too"))
     else:
         add(Check("tool calling", OK, "refused: the model can only produce text"))
+    if cfg.gateway.allowed_origins:
+        key = "with" if cfg.gateway.api_key_env else "without"
+        add(Check("browser origins", WARN, f"{', '.join(cfg.gateway.allowed_origins)} may call the gateway {key} an "
+                  "API key: any script running on those pages can too, and the page renders the output",
+                  "set gateway.api_key_env, and make sure the client does not render remote images or HTML"
+                  if not cfg.gateway.api_key_env else "make sure the client does not render remote images or HTML"))
     checks.extend(session_checks())
     return checks
 

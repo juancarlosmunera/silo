@@ -163,8 +163,16 @@ anything unknown, hidden directories included. It records size, mtime and SHA-25
 manifest outside the model directory; `silo up` refuses to start if the directory no longer
 matches.
 
+GGUF headers are parsed in full before the runtime sees them (`silo/gguf.py`): every count, length
+and string is bounded by the file, keys and tensor names must be unique, arrays cannot nest,
+`general.alignment` must be a power of two, tensors have one to four dimensions whose product fits
+in int64 and a type from ggml's table, and each tensor's data must be aligned, lie inside the file
+and not overlap another. Crafted files aimed at a loader are usually malformed in exactly these
+places. Unknown tensor types are refused unless `silo intake --allow-unknown` is given.
+
 This is a format gate and an integrity record. It does not prove a GGUF is benign: a well-formed
-file can still carry a hostile chat template or trigger a parser bug. That is what the sandbox is
+file can still carry a hostile chat template or trigger a parser bug the check does not foresee.
+`silo intake` shows the size of each file's chat template so that it can be reviewed. That is what the sandbox is
 for. The default launch check compares size and mtime; `silo up --full-verify` rehashes.
 
 ### The gateway
@@ -227,7 +235,9 @@ Stated plainly, in rough order of importance.
 3. **The client.** A chat UI that renders markdown will fetch a remote image by itself, with data
    in the URL. An agent harness will execute tool calls. Both act with the client's network access,
    not the model's. Tool calling is off by default for this reason; if you turn it on, whatever
-   executes the calls is the boundary and needs its own sandbox.
+   executes the calls is the boundary and needs its own sandbox. `gateway.tools` limits which tools
+   can be offered and the model can only call what was offered, but the gateway does not judge a
+   call's arguments beyond size and the output tripwire.
 4. **Local processes.** The gateway listens on loopback, which every process and user on the
    machine can reach. Set `api_key_env` if that matters. The model socket itself is reachable only
    by your user.
@@ -262,7 +272,4 @@ Stated plainly, in rough order of importance.
 
 - Mandatory access control for the sandbox on AppArmor hosts.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
-- An origin allowlist with proper CORS handling, for browser-based clients.
-- Tool-call mediation: per-tool policy instead of all-or-nothing.
-- Structural validation of GGUF files at intake.
 - The probe suite as a CI gate, and verification on GPU hardware and aarch64.

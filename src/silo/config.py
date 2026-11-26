@@ -16,6 +16,7 @@ import re
 import tomllib
 import types
 import typing
+import urllib.parse
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -28,6 +29,7 @@ _MEMORY_RE = re.compile(r"^\d+[bkmg]?$", re.IGNORECASE)
 # An image reference can never look like a podman option or carry whitespace.
 _IMAGE_RE = re.compile(r"^[a-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TOOL_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # silo.toolpolicy.NAME_RE; config must not import the gateway side
 # Never a model directory themselves (a dedicated directory below /srv, /opt, /mnt ... is fine).
 _SYSTEM_DIRS = frozenset(Path(p) for p in (
     "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/media", "/mnt", "/opt", "/proc", "/root",
@@ -92,8 +94,11 @@ class GatewayConfig:
     max_concurrency: int = 4
     scanner: str = "monitor"  # off | monitor | enforce
     allow_tools: bool = False
+    tools: list[str] = field(default_factory=list)  # empty: any tool, when allow_tools is on
+    max_tool_arguments_bytes: int = 32768
     log_content: bool = False
     api_key_env: str | None = None
+    allowed_origins: list[str] = field(default_factory=list)  # browser origins, exact match
 
 
 @dataclass
@@ -227,6 +232,22 @@ def _check_runsc(path: Path) -> None:
                           "directory, e.g. in /usr/local/bin (docs/GVISOR.md)")
 
 
+def _check_origin(origin: str) -> None:
+    """An origin exactly as a browser sends it: scheme://host[:port], lowercase, no default port."""
+    parts = urllib.parse.urlsplit(origin)
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    default = {"http": 80, "https": 443}.get(parts.scheme)
+    if (default is None or not parts.hostname or parts.path or parts.query or parts.fragment
+            or parts.username is not None or parts.password is not None or port == -1 or port == default
+            or origin != origin.lower() or "*" in origin
+            or origin != f"{parts.scheme}://{parts.netloc}"):
+        raise ConfigError(f"gateway.allowed_origins: {origin!r} is not an origin as a browser sends it "
+                          "(http(s)://host[:port], lowercase, no path, no default port, no wildcard)")
+
+
 def validate(cfg: Config) -> Config:
     if not isinstance(cfg.name, str) or not _NAME_RE.match(cfg.name):
         raise ConfigError(f"invalid silo name {cfg.name!r}: use [a-z0-9_.-], max 63 chars")
@@ -263,6 +284,15 @@ def validate(cfg: Config) -> Config:
         raise ConfigError("gateway.port must be 1-65535")
     if gw.max_request_bytes < 1 or gw.max_response_bytes < 1 or gw.max_concurrency < 1:
         raise ConfigError("gateway size and concurrency limits must be >= 1")
+    if gw.tools and not gw.allow_tools:
+        raise ConfigError("gateway.tools is set but gateway.allow_tools = false; enable tool calling or remove the list")
+    bad_tools = [t for t in gw.tools if not _TOOL_RE.match(t)]
+    if bad_tools or len(set(gw.tools)) != len(gw.tools):
+        raise ConfigError("gateway.tools must be unique names matching [A-Za-z0-9_-]{1,64}")
+    if gw.max_tool_arguments_bytes < 1:
+        raise ConfigError("gateway.max_tool_arguments_bytes must be >= 1")
+    for origin in gw.allowed_origins:
+        _check_origin(origin)
     if gw.api_key_env is not None and not _ENV_RE.match(gw.api_key_env):
         raise ConfigError("gateway.api_key_env must be an environment variable name")
     if m.ctx_size < 1 or (m.threads is not None and m.threads < 1):
