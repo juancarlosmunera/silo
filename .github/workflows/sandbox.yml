@@ -1,7 +1,8 @@
 name: sandbox
 
 # Runs the escape probes and a real model inside a silo, on x86_64 and aarch64 GitHub runners:
-# once on the host kernel (connector, exec lock, argument allowlists) and once on gVisor.
+# once on the host kernel (connector, exec lock, argument allowlists) and once on gVisor (its systrap
+# platform on both, its KVM platform on x86_64, where the runners have nested virtualisation).
 # GitHub's Ubuntu runners give rootless Podman no SELinux or AppArmor confinement, so `proc.lsm`
 # is the one probe allowed to fail here (see docs/VPS.md, "Other distributions").
 
@@ -118,13 +119,19 @@ jobs:
         run: bin/silo --config "$RUNNER_TEMP/silo-kill.toml" down || true
 
   gvisor:
-    name: gVisor (${{ matrix.runner }})
+    name: gVisor (${{ matrix.runner }}, ${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        include:
+          - { runner: ubuntu-24.04, platform: systrap }
+          - { runner: ubuntu-24.04-arm, platform: systrap }
+          # GitHub's x86_64 runners have nested virtualisation, so gVisor's KVM platform runs there too.
+          - { runner: ubuntu-24.04, platform: kvm }
+    env:
+      PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -136,6 +143,19 @@ jobs:
           grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
           podman --version
           uname -m
+
+      # gVisor's sentry runs as the sandbox's unprivileged UID, which is in no group, so /dev/kvm has to
+      # be open to everyone, as it is on Fedora. On Ubuntu it belongs to root and the kvm group.
+      - name: KVM for the sandbox's UID
+        if: matrix.platform == 'kvm'
+        run: |
+          ls -l /dev/kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm-for-all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          ls -l /dev/kvm
+          test "$(stat -c %a /dev/kvm)" = 666
 
       # gVisor's own installation steps (docs/GVISOR.md): download, verify the checksum, unpack as root
       # where the sandbox's unprivileged UID can reach it and nobody but root can change it. On these
@@ -175,6 +195,7 @@ jobs:
           memory = "1g"
           seccomp_action = "$mode"
           runsc = "/usr/lib/gvisor/runsc"
+          gvisor_platform = "$PLATFORM"
           [gateway]
           port = 8089
           scanner = "enforce"
@@ -208,8 +229,17 @@ jobs:
           curl -sfN http://127.0.0.1:8089/v1/chat/completions -H 'Content-Type: application/json' \
             -d '{"messages":[{"role":"user","content":"Count to three"}],"max_tokens":16,"stream":true}' | tail -n 2
           bin/silo --config "$cfg" status
-          bin/silo --config "$cfg" status | grep -q '"kernel": "gvisor'
+          bin/silo --config "$cfg" status | grep -q "\"kernel\": \"gvisor ($PLATFORM)\""
           test "$(podman container inspect --format '{{.State.Running}}' silo-gv-kill)" = true
+          # the platform asked for is the one in use: the sentry's command line, and whether it holds
+          # a KVM virtual machine
+          pid=$(podman container inspect --format '{{.State.Pid}}' silo-gv-kill)
+          tr '\0' ' ' < "/proc/$pid/cmdline" | grep -o -- '--platform=[a-z]*'
+          tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q -- "--platform=$PLATFORM "
+          fds=$(sudo ls -l "/proc/$pid/fd")
+          vms=$(printf '%s\n' "$fds" | grep -c 'anon_inode:kvm-vm' || true)
+          echo "KVM virtual machines held by the sentry: $vms"
+          if [ "$PLATFORM" = kvm ]; then test "$vms" -ge 1; else test "$vms" = 0; fi
 
       - name: Logs on failure
         if: failure()
