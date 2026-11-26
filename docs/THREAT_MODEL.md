@@ -284,4 +284,4 @@ Stated plainly, in rough order of importance.
 ## Roadmap
 
 - Mandatory access control for the sandbox on AppArmor hosts.
-- The probe suite as a CI gate, and verification on NVIDIA and AMD GPUs and on aarch64.
+- Verification on NVIDIA and AMD GPUs.

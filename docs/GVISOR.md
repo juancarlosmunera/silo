@@ -42,9 +42,13 @@ The cost:
 ## What this was tested on
 
 Fedora 43 (kernel 7.3), rootless Podman 5.8.9, gVisor `release-20261123.1`, x86_64, llama.cpp's
-server image (build b12242), Qwen2.5-0.5B-Instruct. Not tried: aarch64, Ubuntu, a host that is
-itself a virtual machine, and an installation in `/usr/local/bin` (the test machine had no root
-access, so gVisor was unpacked into a directory owned by the user and readable by everyone).
+server image (build b12242), Qwen2.5-0.5B-Instruct. That machine had no root access, so gVisor
+was unpacked there into a directory owned by the user and readable by everyone.
+
+The probes and a small model also run on gVisor in CI for every change: Ubuntu 24.04, Podman 4.9,
+x86_64 and aarch64, on machines that are themselves virtual machines, with gVisor installed by
+root. Only the `systrap` platform is covered there; `kvm` has been tried on the Fedora machine
+alone.
 
 ## 1. Install gVisor
 

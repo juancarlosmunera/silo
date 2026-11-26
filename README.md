@@ -4,6 +4,7 @@
 nowhere to go, and one narrow, logged channel for prompts and answers.
 
 [![ci](https://github.com/juancarlosmunera/silo/actions/workflows/ci.yml/badge.svg)](https://github.com/juancarlosmunera/silo/actions/workflows/ci.yml)
+[![sandbox](https://github.com/juancarlosmunera/silo/actions/workflows/sandbox.yml/badge.svg)](https://github.com/juancarlosmunera/silo/actions/workflows/sandbox.yml)
 
 When you run open-weight models on your own machine or on a VPS, you load a multi-gigabyte file
 from the internet into a runtime that parses it, usually on a box that also holds your SSH keys,
@@ -21,10 +22,11 @@ anything on the host. What it can still do is answer, so the answer is the one c
 the gateway exists to narrow and record it.
 
 > **Status: 0.1, early.** Verified on Fedora 43 (SELinux enforcing) with rootless Podman 5.6 and
-> 5.8, x86_64, CPU inference, running llama.cpp's server. Also exercised on Ubuntu 24.04, where one
-> layer is missing ([details](docs/VPS.md#other-distributions)). GPU passthrough verified on an
-> Intel GPU (`gpu = "dri"`, llama.cpp's Vulkan image). Not yet verified: NVIDIA and AMD GPUs,
-> aarch64. silo lowers risk; it is not a guarantee. Read [Limits](#limits) before relying on it.
+> 5.8, x86_64, running llama.cpp's server. The escape probes and a small model also run in CI for
+> every change, on Ubuntu 24.04 with Podman 4.9, on x86_64 and aarch64, on the host kernel and on
+> gVisor; one layer is missing on Ubuntu ([details](docs/VPS.md#other-distributions)). GPU
+> passthrough is verified on an Intel GPU (`gpu = "dri"`, llama.cpp's Vulkan image) and not on
+> NVIDIA or AMD. silo lowers risk; it is not a guarantee. Read [Limits](#limits) before relying on it.
 
 **Contents:** [Isn't a container enough?](#isnt-a-container-enough) ·
 [How it works](#how-it-works) · [Check it yourself](#check-it-yourself) ·
@@ -378,7 +380,7 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 ## Roadmap
 
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
-- Verification on NVIDIA and AMD GPUs, aarch64 and hosts without SELinux.
+- Verification on NVIDIA and AMD GPUs.
 
 ## Development
 
@@ -386,9 +388,12 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 PYTHONPATH=src python3 -m unittest discover -s tests   # no network, no Podman needed
 ```
 
-The unit tests run in CI on Python 3.11 and 3.13. The escape probes need a real Podman host, so
-run `silo probe` and `silo probe --baseline` locally when you change anything in `sandbox.py`,
-`seccomp.py` or `runtime.py`.
+The unit tests run in CI on Python 3.11 and 3.13. A second workflow (`sandbox.yml`) runs the escape
+probes in both seccomp modes and a small model in a silo, on x86_64 and aarch64, on the host kernel
+and on gVisor, and fails on any probe that is not contained. It runs on GitHub's Ubuntu machines,
+so it does not cover SELinux: run `silo probe` and `silo probe --baseline` on your own host as well
+when you change anything in `sandbox.py`, `seccomp.py`, `runtime.py`, `connector.py` or
+`execlock.py`.
 
 ```
 src/silo/sandbox.py     the podman flags, and the check that refuses to launch without them
