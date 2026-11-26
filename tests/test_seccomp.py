@@ -249,9 +249,39 @@ class ArgumentAllowlistTests(unittest.TestCase):
                 for rule in rules:
                     self.assertTrue(rule.get("args"), f"{name} has a rule without argument conditions")
 
-    def test_block_complement_rejects_wide_values(self):
+    def test_complement_rejects_wide_values(self):
         with self.assertRaises(ValueError):
-            seccomp._blocks(2, [1, 1 << 33])
+            seccomp._complement(2, [1, 1 << 33])
+
+    def test_no_rule_compares_an_argument_twice(self):
+        # libseccomp evaluates both comparisons of a rule like `> a AND < b`. gVisor keeps one per
+        # argument and silently drops the other, which widens a deny rule until it kills allowlisted
+        # calls. A profile that never does it means the same thing to both.
+        profiles = [self.profile(), self.profile(action="kill"), self.profile(cpu_only=False)]
+        if SYSTEM_BASE.is_file():
+            profiles.append(seccomp.harden(json.loads(SYSTEM_BASE.read_text()), machine="x86_64"))
+        for profile in profiles:
+            for rule in profile["syscalls"]:
+                indexes = [arg["index"] for arg in rule.get("args") or []]
+                self.assertEqual(len(indexes), len(set(indexes)), f"{rule['names']}: {rule.get('args')}")
+
+    def test_same_verdict_if_an_engine_takes_the_first_matching_rule(self):
+        # Disjoint rules make evaluation order irrelevant; this pins it for the calls that matter.
+        p = self.profile(action="kill")
+        cases = ((("setsockopt", {1: 1, 2: 2}), "SCMP_ACT_ALLOW"),       # SO_REUSEADDR: what llama-server does first
+                 (("setsockopt", {1: 1, 2: 20}), "SCMP_ACT_ALLOW"),
+                 (("setsockopt", {1: 6, 2: 1}), "SCMP_ACT_ALLOW"),
+                 (("setsockopt", {1: 1, 2: 26}), "SCMP_ACT_KILL_PROCESS"),
+                 (("setsockopt", {1: 3, 2: 2}), "SCMP_ACT_KILL_PROCESS"),
+                 (("ioctl", {1: 0x541B}), "SCMP_ACT_ALLOW"),
+                 (("ioctl", {1: 0x5412}), "SCMP_ACT_KILL_PROCESS"),
+                 (("prctl", {0: 15}), "SCMP_ACT_ALLOW"),
+                 (("prctl", {0: 35}), "SCMP_ACT_KILL_PROCESS"))
+        for (name, args), verdict in cases:
+            with self.subTest(name=name, args=args):
+                first = next(r for r in rules_for(p, name)
+                             if all(OPS[c["op"]](({0: 0, 1: 0, 2: 0} | args)[c["index"]], c) for c in r["args"]))
+                self.assertEqual(first["action"], verdict)
 
 
 if __name__ == "__main__":
