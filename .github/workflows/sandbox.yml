@@ -120,6 +120,17 @@ jobs:
           sudo cat "/proc/$(podman container inspect --format '{{.State.Pid}}' silo-ci-kill)/attr/current"
           sudo cat "/proc/$(podman container inspect --format '{{.State.Pid}}' silo-ci-kill)/attr/current" | grep -q silo-runtime
 
+      # Everything the profile refused during this job. The probes' canary write is the only thing that
+      # should be here: anything else means the profile is in the way of the runtime or the probes.
+      - name: What AppArmor denied
+        if: always()
+        run: |
+          sudo dmesg 2>/dev/null | grep 'apparmor="DENIED"' | grep 'silo-runtime' > "$RUNNER_TEMP/denied.txt" || true
+          sed -E 's/.*operation="([^"]*)".*name="([^"]*)".*comm="([^"]*)".*/\1 \2 (\3)/' "$RUNNER_TEMP/denied.txt" | sort | uniq -c
+          unexpected=$(grep -vc 'name="/tmp/.silo-apparmor-canary"' "$RUNNER_TEMP/denied.txt" || true)
+          echo "denials other than the canary: $unexpected"
+          test "$unexpected" = 0
+
       - name: Logs on failure
         if: failure()
         run: |

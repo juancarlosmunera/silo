@@ -24,7 +24,7 @@ the gateway exists to narrow and record it.
 > **Status: 0.1, early.** Verified on Fedora 43 (SELinux enforcing) with rootless Podman 5.6 and
 > 5.8, x86_64, running llama.cpp's server. The escape probes and a small model also run in CI for
 > every change, on Ubuntu 24.04 with Podman 4.9, on x86_64 and aarch64, on the host kernel and on
-> gVisor; one layer is missing on Ubuntu ([details](docs/VPS.md#other-distributions)). GPU
+> gVisor; Ubuntu needs one step as root for its AppArmor layer ([details](docs/VPS.md#other-distributions)). GPU
 > passthrough is verified on an Intel GPU (`gpu = "dri"`, llama.cpp's Vulkan image) and not on
 > NVIDIA or AMD. silo lowers risk; it is not a guarantee. Read [Limits](#limits) before relying on it.
 
@@ -62,7 +62,7 @@ first item under [Limits](#limits).
 |---|---|
 | **Network** | `--network=none`: a private loopback, no routes, no resolver. Independently, seccomp allows `socket()` and `socketpair()` for `AF_UNIX` only and denies the ways around that filter: io_uring, `socketcall`, and the 32-bit and x32 syscall ABIs. Optionally, a host firewall rule drops everything the sandbox user originates ([host/](host/README.md)). |
 | **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. On CPU-only sandboxes, `ioctl`, `prctl` and `setsockopt` are limited to the argument values an inference server uses, measured on llama-server: no driver ioctls, no socket filters. |
-| **Privilege** | Rootless Podman, so container root is not host root. The runtime runs as `nobody`, mapped to a subordinate UID that owns nothing on the host. Every capability dropped, bounding set included. `no-new-privileges`. SELinux `container_t` with per-container categories. |
+| **Privilege** | Rootless Podman, so container root is not host root. The runtime runs as `nobody`, mapped to a subordinate UID that owns nothing on the host. Every capability dropped, bounding set included. `no-new-privileges`. SELinux `container_t` with per-container categories, or on hosts without SELinux an AppArmor profile of silo's own. |
 | **Filesystem, persistence** | Read-only root. Model directory mounted read-only. The only writable location is a 64 MB `noexec` tmpfs. No `memfd_create` on CPU-only sandboxes, so no fileless exec either. Environment stripped. No Podman, D-Bus, display, audio or agent sockets visible. |
 | **Running other programs** | Once the runtime has started, nothing else can be executed in the sandbox. Every `execve` is put to a supervisor on the host, which lets the container's own first one through and refuses the rest. The shell, `curl` and Python that ship in the runtime image are of no use to a compromised runtime, and neither is a binary it brought along. Not available on gVisor. |
 | **The runtime's socket** | No host directory is shared with the sandbox. llama-server listens on an abstract UNIX socket, which exists only inside its own network namespace; a small connector started through `podman unshare` joins that namespace, drops every capability and hands each connection to the gateway, which checks the peer is the sandbox's UID. |
@@ -104,8 +104,10 @@ configuration, not the ones silo was developed on.
 
 - Linux on x86_64 with cgroup v2.
 - Podman, running rootless. Verified with 5.8. Docker is not supported.
-- SELinux in enforcing mode is strongly recommended, and is what silo is verified with. On Ubuntu
-  rootless Podman gets no SELinux or AppArmor confinement at all, so that layer is absent there.
+- A mandatory access control layer: SELinux in enforcing mode, which is what Fedora has and what
+  silo is developed with, or AppArmor with silo's own profile loaded. On Ubuntu and Debian rootless
+  Podman applies neither by itself, so load the profile first ([host/](host/README.md)), or that
+  layer is absent.
   `silo doctor` reports what your host provides.
 - Python 3.11 or newer. silo has no Python dependencies.
 - A model in GGUF format and enough RAM to hold it. Inference runs on the CPU.
@@ -379,7 +381,6 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 
 ## Roadmap
 
-- Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
 - Verification on NVIDIA and AMD GPUs.
 
 ## Development
@@ -409,7 +410,8 @@ src/silo/doctor.py      host and configuration checks
 src/silo/hostrules.py   host firewall rule generation
 bin/silo                runs silo from a checkout, ignoring the current directory
 bin/silo-vm             creates and runs a local VM with no network device
-host/                   optional root-level hardening: firewall rules, sysctls
+src/silo/apparmor.py    AppArmor on hosts without SELinux: detection, and the runtime wrapper that sets the profile
+host/                   optional root-level hardening: firewall rules, sysctls, the AppArmor profile
 examples/               annotated configuration, systemd unit
 docs/THREAT_MODEL.md    assumptions, controls, residual risk
 docs/VPS.md             deploying on a rented server, step by step
