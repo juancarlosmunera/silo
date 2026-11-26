@@ -1,6 +1,7 @@
 name: sandbox
 
-# Runs the escape probes and a real model inside a silo, on x86_64 and aarch64 GitHub runners.
+# Runs the escape probes and a real model inside a silo, on x86_64 and aarch64 GitHub runners:
+# once on the host kernel (connector, exec lock, argument allowlists) and once on gVisor.
 # GitHub's Ubuntu runners give rootless Podman no SELinux or AppArmor confinement, so `proc.lsm`
 # is the one probe allowed to fail here (see docs/VPS.md, "Other distributions").
 
@@ -115,3 +116,105 @@ jobs:
       - name: Clean up
         if: always()
         run: bin/silo --config "$RUNNER_TEMP/silo-kill.toml" down || true
+
+  gvisor:
+    name: gVisor (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Podman, rootless
+        run: |
+          command -v podman >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq podman; }
+          grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+          podman --version
+          uname -m
+
+      # gVisor's own installation steps (docs/GVISOR.md): download, verify the checksum, unpack as root
+      # into /usr/local/bin, which the sandbox's unprivileged UID can reach and cannot change.
+      - name: gVisor
+        run: |
+          set -e
+          URL=https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "$URL/gvisor.tar.zstd"
+          curl -fsSLO "$URL/gvisor.tar.zstd.sha512"
+          sha512sum -c gvisor.tar.zstd.sha512
+          sudo tar --zstd -xf gvisor.tar.zstd -C /usr/local/bin
+          ls -ld /usr/local/bin/runsc /usr/local/bin/gvisor-bin
+          /usr/local/bin/runsc --version
+
+      - name: Images
+        run: |
+          podman pull -q "$PROBE_IMAGE"
+          podman pull -q "$RUNTIME_IMAGE"
+
+      - name: Model
+        run: |
+          mkdir -p "$RUNNER_TEMP/models/smollm2"
+          curl -sSfL -o "$RUNNER_TEMP/models/smollm2/model.gguf" "$MODEL_URL"
+          for mode in errno kill; do
+            cat > "$RUNNER_TEMP/gvisor-$mode.toml" <<TOML
+          [silo]
+          name = "gv-$mode"
+          [model]
+          dir = "$RUNNER_TEMP/models/smollm2"
+          file = "model.gguf"
+          ctx_size = 1024
+          [runtime]
+          memory = "1g"
+          seccomp_action = "$mode"
+          runsc = "/usr/local/bin/runsc"
+          [gateway]
+          port = 8089
+          scanner = "enforce"
+          TOML
+          done
+
+      - name: Doctor
+        run: bin/silo --config "$RUNNER_TEMP/gvisor-errno.toml" doctor || true
+
+      - name: Escape probes on gVisor (errno)
+        run: |
+          bin/silo --config "$RUNNER_TEMP/gvisor-errno.toml" probe --json > "$RUNNER_TEMP/gv-errno.json" || true
+          python3 .github/scripts/probe_gate.py "$RUNNER_TEMP/gv-errno.json" errno
+
+      - name: Escape probes on gVisor (kill)
+        run: |
+          bin/silo --config "$RUNNER_TEMP/gvisor-kill.toml" probe --json > "$RUNNER_TEMP/gv-kill.json" || true
+          python3 .github/scripts/probe_gate.py "$RUNNER_TEMP/gv-kill.json" kill
+
+      - name: Model on gVisor (kill mode)
+        run: |
+          cfg="$RUNNER_TEMP/gvisor-kill.toml"
+          bin/silo --config "$cfg" intake
+          bin/silo --config "$cfg" up --detach
+          bin/silo --config "$cfg" gateway > "$RUNNER_TEMP/gateway.log" 2>&1 &
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:8089/health && break; sleep 1; done
+          reply=$(curl -sf http://127.0.0.1:8089/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":16}')
+          echo "$reply"
+          python3 -c 'import json,sys; c=json.loads(sys.argv[1])["choices"][0]["message"]["content"]; assert c.strip(), "empty"' "$reply"
+          curl -sfN http://127.0.0.1:8089/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"Count to three"}],"max_tokens":16,"stream":true}' | tail -n 2
+          bin/silo --config "$cfg" status
+          bin/silo --config "$cfg" status | grep -q '"kernel": "gvisor'
+          test "$(podman container inspect --format '{{.State.Running}}' silo-gv-kill)" = true
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          cat "$RUNNER_TEMP/gateway.log" 2>/dev/null || true
+          podman logs --tail 50 silo-gv-kill 2>/dev/null || true
+          cat "$RUNNER_TEMP"/gv-*.json 2>/dev/null | head -c 4000 || true
+
+      - name: Clean up
+        if: always()
+        run: bin/silo --config "$RUNNER_TEMP/gvisor-kill.toml" down || true
