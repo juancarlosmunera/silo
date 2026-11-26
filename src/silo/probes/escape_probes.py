@@ -354,19 +354,33 @@ def probe_readonly():
             record(probe, "PASS", f"write to {path} refused ({err.strerror})")
 
 
+# Kernel-provided filesystems that cannot be a host directory.
+PSEUDO_FILESYSTEMS = ("proc", "sysfs", "cgroup2", "devpts", "mqueue")
+
+
+def shared_writable_dirs(mountinfo, isdir=os.path.isdir):
+    """Mount points of writable directory mounts outside the sandbox's own scratch set.
+
+    Whatever the filesystem: a host directory under /run/user is tmpfs too, so the type says nothing
+    about where a mount comes from. Device nodes and single files are not directories; they are
+    judged by dev.nodes and fs.unexpected_rw_mounts.
+    """
+    found = []
+    for line in mountinfo:
+        fields = line.split()
+        target, opts = fields[4], fields[5].split(",")
+        fstype = fields[fields.index("-") + 1] if "-" in fields else ""
+        if "rw" in opts and target not in EXPECTED_RW_MOUNTS and fstype not in PSEUDO_FILESYSTEMS and isdir(target):
+            found.append(target)
+    return found
+
+
 def probe_socket_dir():
     # The runtime answers on an abstract UNIX socket inside its own network namespace; the gateway
     # reaches it through silo's connector. No host directory is mounted into the sandbox writable.
-    host_mounts = []
     try:
         with open("/proc/self/mountinfo") as fh:
-            for line in fh:
-                fields = line.split()
-                target, opts = fields[4], fields[5].split(",")
-                fstype = fields[fields.index("-") + 1] if "-" in fields else ""
-                if ("rw" in opts and target not in EXPECTED_RW_MOUNTS
-                        and fstype not in ("tmpfs", "proc", "sysfs", "cgroup2", "devpts", "mqueue")):
-                    host_mounts.append(target)
+            host_mounts = shared_writable_dirs(fh)
     except (OSError, IndexError, ValueError) as exc:
         return record("fs.no_shared_dir", "WARN", f"cannot read the mount table ({exc})")
     if host_mounts:
