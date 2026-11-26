@@ -25,9 +25,26 @@ EXTRA_MASKED_PATHS = ("/proc/kallsyms", "/proc/modules", "/proc/cmdline", "/sys/
 GPU_DEVICES = {
     "none": (),
     "nvidia": ("nvidia.com/gpu=all",),  # CDI; requires nvidia-container-toolkit CDI spec
-    "amd": ("/dev/kfd", "/dev/dri"),
-    "dri": ("/dev/dri",),  # Vulkan / Intel
+    "amd": ("/dev/kfd",),  # plus the render nodes (ROCm)
+    "dri": (),  # the render nodes only (Vulkan: Intel, AMD, ...)
 }
+DRI_DIR = Path("/dev/dri")
+
+
+def gpu_devices(gpu: str, dri_dir: Path = DRI_DIR) -> tuple[str, ...]:
+    """Device nodes for a GPU mode.
+
+    For DRM GPUs only the render nodes (/dev/dri/renderD*) are passed: they are all compute needs.
+    The primary nodes (/dev/dri/card*) carry modesetting and display control, a larger and more
+    privileged driver interface, and are never handed to a sandbox.
+    """
+    devices = GPU_DEVICES[gpu]
+    if gpu in ("amd", "dri"):
+        render = sorted(str(p) for p in dri_dir.glob("renderD*"))
+        if not render:
+            raise HardeningError(f"runtime.gpu = {gpu!r} but there is no render node in {dri_dir}")
+        devices = devices + tuple(render)
+    return devices
 
 # Flags that must appear in every silo container.
 REQUIRED_FLAGS = (
@@ -160,7 +177,7 @@ def podman_run_args(
     ]
     if rt.cpus:
         args.append(f"--cpus={rt.cpus}")
-    for device in GPU_DEVICES[gpu]:
+    for device in gpu_devices(gpu):
         args.append(f"--device={device}")
     for mount in mounts:
         args.append(mount.flag())

@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -29,7 +30,18 @@ class SandboxArgsTests(unittest.TestCase):
 
     def test_gpu_devices(self):
         self.assertIn("--device=nvidia.com/gpu=all", build(gpu="nvidia"))
-        self.assertIn("--device=/dev/dri", build(gpu="dri"))
+        with tempfile.TemporaryDirectory() as tmp:
+            dri = Path(tmp)
+            for name in ("card0", "card1", "renderD128", "renderD129", "by-path"):
+                (dri / name).touch()
+            self.assertEqual(sandbox.gpu_devices("dri", dri), (f"{tmp}/renderD128", f"{tmp}/renderD129"))
+            self.assertEqual(sandbox.gpu_devices("amd", dri), ("/dev/kfd", f"{tmp}/renderD128", f"{tmp}/renderD129"))
+            for name in ("renderD128", "renderD129"):
+                (dri / name).unlink()
+            with self.assertRaises(sandbox.HardeningError):
+                sandbox.gpu_devices("dri", dri)
+        self.assertEqual(sandbox.gpu_devices("none"), ())
+        self.assertFalse(any("/card" in d for d in sandbox.gpu_devices("dri")) if sandbox.DRI_DIR.is_dir() else False)
 
     def test_mounts(self):
         args = build(mounts=[sandbox.Mount(Path("/m"), "/models", shared_label=True),

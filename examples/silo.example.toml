@@ -32,7 +32,8 @@ pids_limit = 256
 # runtime. Use "kill" once your model runs cleanly; it turns probing into a crash you will notice.
 seccomp_action = "errno"
 # "none" | "nvidia" | "amd" | "dri". Anything but "none" exposes a GPU driver to the sandbox and
-# keeps memfd_create allowed. Not yet verified on real hardware.
+# keeps memfd_create allowed. "dri" and "amd" pass only the render nodes (/dev/dri/renderD*), never
+# the display nodes. Verified with "dri" on an Intel GPU and llama.cpp's server-vulkan image.
 gpu = "none"
 # seccomp_base = "/usr/share/containers/seccomp.json"
 startup_timeout = 600.0
