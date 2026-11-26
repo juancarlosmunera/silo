@@ -16,6 +16,7 @@ import re
 import tomllib
 import types
 import typing
+import urllib.parse
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -94,6 +95,7 @@ class GatewayConfig:
     max_tool_arguments_bytes: int = 32768
     log_content: bool = False
     api_key_env: str | None = None
+    allowed_origins: list[str] = field(default_factory=list)  # browser origins, exact match
 
 
 @dataclass
@@ -175,6 +177,22 @@ def _check_model_dir(path: Path) -> None:
         raise ConfigError("model.dir must not contain ':' or ',' (podman volume syntax)")
 
 
+def _check_origin(origin: str) -> None:
+    """An origin exactly as a browser sends it: scheme://host[:port], lowercase, no default port."""
+    parts = urllib.parse.urlsplit(origin)
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    default = {"http": 80, "https": 443}.get(parts.scheme)
+    if (default is None or not parts.hostname or parts.path or parts.query or parts.fragment
+            or parts.username is not None or parts.password is not None or port == -1 or port == default
+            or origin != origin.lower() or "*" in origin
+            or origin != f"{parts.scheme}://{parts.netloc}"):
+        raise ConfigError(f"gateway.allowed_origins: {origin!r} is not an origin as a browser sends it "
+                          "(http(s)://host[:port], lowercase, no path, no default port, no wildcard)")
+
+
 def validate(cfg: Config) -> Config:
     if not isinstance(cfg.name, str) or not _NAME_RE.match(cfg.name):
         raise ConfigError(f"invalid silo name {cfg.name!r}: use [a-z0-9_.-], max 63 chars")
@@ -209,6 +227,8 @@ def validate(cfg: Config) -> Config:
         raise ConfigError("gateway.tools must be unique names matching [A-Za-z0-9_-]{1,64}")
     if gw.max_tool_arguments_bytes < 1:
         raise ConfigError("gateway.max_tool_arguments_bytes must be >= 1")
+    for origin in gw.allowed_origins:
+        _check_origin(origin)
     if gw.api_key_env is not None and not _ENV_RE.match(gw.api_key_env):
         raise ConfigError("gateway.api_key_env must be an environment variable name")
     if m.ctx_size < 1 or (m.threads is not None and m.threads < 1):

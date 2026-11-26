@@ -196,6 +196,5 @@ Stated plainly, in rough order of importance.
 - Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - Locking down `execve` after the runtime has started.
-- An origin allowlist with proper CORS handling, for browser-based clients.
 - Structural validation of GGUF files at intake.
 - The probe suite as a CI gate, and verification on GPU hardware and aarch64.

@@ -252,6 +252,79 @@ class GatewayTests(unittest.TestCase):
             with self.subTest(host=host):
                 self.assertEqual(self.request("GET", "/health", headers={"Host": host})[0], 200)
 
+    def test_allowed_origins(self):
+        origin = "http://localhost:3000"
+        self.start(allowed_origins=[origin])
+        # simple request from the allowed origin: served, and readable by the page
+        status, headers, _ = self.request("GET", "/health", headers={"Origin": origin})
+        self.assertEqual(status, 200)
+        self.assertEqual((headers["Access-Control-Allow-Origin"], headers["Vary"]), (origin, "Origin"))
+        self.assertNotIn("Access-Control-Allow-Credentials", headers)
+        status, headers, body = self.request(
+            "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}, {"Origin": origin})
+        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (200, origin))
+        # errors are readable too, so a browser client can show why it was refused
+        status, headers, _ = self.request("POST", "/v1/chat/completions", {"messages": [], "tools": []},
+                                          {"Origin": origin})
+        self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (403, origin))
+        # anything else is refused, and gets no CORS headers
+        for other in ("http://localhost:3001", "https://localhost:3000", "http://LOCALHOST:3000", "null",
+                      "http://localhost:3000.attacker.example"):
+            with self.subTest(origin=other):
+                status, headers, _ = self.request("GET", "/health", headers={"Origin": other})
+                self.assertEqual(status, 403)
+                self.assertNotIn("Access-Control-Allow-Origin", headers)
+        # an allowed origin does not lift the DNS-rebinding check
+        self.assertEqual(self.request("GET", "/health", headers={"Origin": origin, "Host": "evil.example"})[0], 403)
+        # two Origin headers: refused
+        reply = self.raw(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: " + origin.encode() +
+                         b"\r\nOrigin: http://attacker.example\r\n\r\n")
+        self.assertIn(b" 403 ", reply.split(b"\r\n", 1)[0])
+
+    def test_cors_preflight(self):
+        origin = "https://chat.example"
+        self.start(allowed_origins=[origin])
+        FakeLlama.seen.clear()
+        status, headers, body = self.request("OPTIONS", "/v1/chat/completions", headers={
+            "Origin": origin, "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type, authorization, x-stainless-os",
+            "Access-Control-Request-Private-Network": "true"})
+        self.assertEqual((status, body), (204, b""))
+        self.assertEqual(headers["Access-Control-Allow-Origin"], origin)
+        self.assertEqual(headers["Access-Control-Allow-Methods"], "POST")
+        self.assertEqual(headers["Access-Control-Allow-Headers"], "content-type, authorization, x-stainless-os")
+        self.assertEqual(headers["Access-Control-Allow-Private-Network"], "true")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(self.audit()[-1]["preflight"], "POST")
+        refused = (
+            ({"Origin": origin, "Access-Control-Request-Method": "DELETE"}, "/v1/chat/completions", 403),
+            ({"Origin": origin, "Access-Control-Request-Method": "POST"}, "/health", 403),
+            ({"Origin": origin, "Access-Control-Request-Method": "GET"}, "/slots", 404),
+            ({"Origin": origin, "Access-Control-Request-Method": "POST",
+              "Access-Control-Request-Headers": "content-type, bad header"}, "/v1/completions", 400),
+            ({"Origin": "https://attacker.example", "Access-Control-Request-Method": "POST"}, "/v1/completions", 403),
+            ({"Access-Control-Request-Method": "POST"}, "/v1/completions", 405),  # no Origin: not a preflight
+        )
+        for hdrs, path, expected in refused:
+            with self.subTest(path=path, headers=hdrs):
+                status, headers, _ = self.request("OPTIONS", path, headers=hdrs)
+                self.assertEqual(status, expected)
+                self.assertNotIn("Access-Control-Allow-Methods", headers)
+        self.assertEqual(FakeLlama.seen, [])
+
+    def test_cors_does_not_bypass_api_key(self):
+        os.environ["SILO_TEST_KEY"] = "s3cret"
+        self.addCleanup(os.environ.pop, "SILO_TEST_KEY")
+        origin = "http://localhost:3000"
+        self.start(api_key_env="SILO_TEST_KEY", allowed_origins=[origin])
+        # the preflight carries no credentials and is answered; the request itself still needs the key
+        self.assertEqual(self.request("OPTIONS", "/v1/models", headers={
+            "Origin": origin, "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization"})[0], 204)
+        self.assertEqual(self.request("GET", "/v1/models", headers={"Origin": origin})[0], 401)
+        self.assertEqual(self.request("GET", "/v1/models", headers={
+            "Origin": origin, "Authorization": "Bearer s3cret"})[0], 200)
+
     def test_post_must_be_json(self):
         self.start(max_request_bytes=200)
         body = json.dumps({"prompt": "hi"}).encode()

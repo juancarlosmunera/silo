@@ -203,8 +203,8 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
-Streaming works the same way. Browser-based clients are refused: any request that carries an
-`Origin` header is.
+Streaming works the same way. Browser-based clients are refused (any request that carries an
+`Origin` header is) unless their origin is listed in `gateway.allowed_origins`.
 
 Ctrl-C stops the gateway and the sandbox and removes the socket directory.
 
@@ -276,6 +276,7 @@ The settings that matter most. Every option, with comments, is in
 | `gateway.tools` | `[]` | With tool calling on: the only tool names a request may offer. Empty means any. |
 | `gateway.max_tool_arguments_bytes` | `32768` | Cap on the arguments of each tool call the model makes. |
 | `gateway.log_content` | `false` | Record prompts and completions in the audit log, not only their hashes. |
+| `gateway.allowed_origins` | `[]` | Browser origins allowed to call the gateway, exactly as the browser sends them, e.g. `"http://localhost:3000"`. |
 | `gateway.api_key_env` | none | Name of an environment variable holding a bearer token that clients must send. |
 
 ## The gateway
@@ -290,8 +291,12 @@ The gateway treats both sides as untrusted and terminates the protocol instead o
 - **Nothing renderable.** The gateway sets the response type itself (JSON or an event stream) and
   sends `nosniff` and a deny-all CSP, so a compromised runtime cannot serve a page to a browser that
   opens the gateway URL.
-- **No drive-by access.** Requests with an `Origin` header, a non-loopback `Host` (DNS rebinding)
-  or a POST that is not `application/json` are refused.
+- **No drive-by access.** Requests with a non-loopback `Host` (DNS rebinding) or a POST that is not
+  `application/json` are refused, and so are requests with an `Origin` header, unless that exact
+  origin is listed in `gateway.allowed_origins`. Listed origins get CORS headers and their
+  preflights are answered by the gateway itself; the response never allows credentials, and the
+  API key, if set, is still required. A listed page can use the model, and so can any script that
+  runs on it, so list only clients you trust and keep them from rendering remote images or HTML.
 - **Text only by default.** Requests that carry tools or functions are refused, and tool calls from
   the model are cut off, unless `allow_tools = true`.
 - **Per-tool policy when tools are on.** `gateway.tools` lists the tools a client may offer; anything
@@ -349,7 +354,6 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
 - Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
-- An origin allowlist with proper CORS handling, for browser-based clients.
 - Verification on GPU hardware, aarch64 and hosts without SELinux.
 
 ## Development
