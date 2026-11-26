@@ -359,9 +359,10 @@ run `silo probe` and `silo probe --baseline` locally when you change anything in
 src/silo/sandbox.py     the podman flags, and the check that refuses to launch without them
 src/silo/seccomp.py     profile hardening, with the reason for every denied syscall
 src/silo/gateway.py     the host-side proxy
+src/silo/connector.py   reaches the runtime's socket inside the sandbox's network namespace
 src/silo/scanner.py     output tripwire rules
 src/silo/intake.py      model-directory vetting and manifest
-src/silo/runtime.py     lifecycle: launch, socket-directory lock, probes
+src/silo/runtime.py     lifecycle: launch, connector, probes
 src/silo/probes/        the escape-probe suite that runs inside the sandbox
 src/silo/doctor.py      host and configuration checks
 src/silo/hostrules.py   host firewall rule generation
