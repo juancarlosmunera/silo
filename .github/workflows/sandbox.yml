@@ -1,0 +1,117 @@
+name: sandbox
+
+# Runs the escape probes and a real model inside a silo, on x86_64 and aarch64 GitHub runners.
+# GitHub's Ubuntu runners give rootless Podman no SELinux or AppArmor confinement, so `proc.lsm`
+# is the one probe allowed to fail here (see docs/VPS.md, "Other distributions").
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROBE_IMAGE: docker.io/library/python:3.13-slim
+  RUNTIME_IMAGE: ghcr.io/ggml-org/llama.cpp:server
+  MODEL_URL: https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf
+
+jobs:
+  sandbox:
+    name: sandbox (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      # Actions are pinned by commit, not by tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Podman, rootless
+        run: |
+          command -v podman >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq podman; }
+          grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+          podman --version
+          uname -m
+          python3 --version
+
+      - name: Images
+        run: |
+          podman pull -q "$PROBE_IMAGE"
+          podman pull -q "$RUNTIME_IMAGE"
+
+      - name: Model
+        run: |
+          mkdir -p "$RUNNER_TEMP/models/smollm2"
+          curl -sSfL -o "$RUNNER_TEMP/models/smollm2/model.gguf" "$MODEL_URL"
+          for mode in errno kill; do
+            cat > "$RUNNER_TEMP/silo-$mode.toml" <<TOML
+          [silo]
+          name = "ci-$mode"
+          [model]
+          dir = "$RUNNER_TEMP/models/smollm2"
+          file = "model.gguf"
+          ctx_size = 1024
+          [runtime]
+          memory = "1g"
+          seccomp_action = "$mode"
+          [gateway]
+          port = 8088
+          scanner = "enforce"
+          TOML
+          done
+
+      - name: Doctor
+        run: bin/silo --config "$RUNNER_TEMP/silo-errno.toml" doctor || true
+
+      - name: Escape probes (errno)
+        run: |
+          bin/silo --config "$RUNNER_TEMP/silo-errno.toml" probe --json > "$RUNNER_TEMP/errno.json" || true
+          python3 .github/scripts/probe_gate.py "$RUNNER_TEMP/errno.json" errno \
+            --allow "proc.lsm=no MAC for rootless Podman on Ubuntu"
+
+      - name: Escape probes (kill)
+        run: |
+          bin/silo --config "$RUNNER_TEMP/silo-kill.toml" probe --json > "$RUNNER_TEMP/kill.json" || true
+          python3 .github/scripts/probe_gate.py "$RUNNER_TEMP/kill.json" kill \
+            --allow "proc.lsm=no MAC for rootless Podman on Ubuntu"
+
+      - name: Baseline (stock container, for comparison)
+        run: |
+          bin/silo --config "$RUNNER_TEMP/silo-errno.toml" probe --baseline -q || true
+
+      - name: Model in a silo (kill mode)
+        run: |
+          cfg="$RUNNER_TEMP/silo-kill.toml"
+          bin/silo --config "$cfg" intake
+          bin/silo --config "$cfg" up --detach
+          bin/silo --config "$cfg" gateway > "$RUNNER_TEMP/gateway.log" 2>&1 &
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:8088/health && break; sleep 1; done
+          reply=$(curl -sf http://127.0.0.1:8088/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":16}')
+          echo "$reply"
+          python3 -c 'import json,sys; c=json.loads(sys.argv[1])["choices"][0]["message"]["content"]; assert c.strip(), "empty"' "$reply"
+          curl -sfN http://127.0.0.1:8088/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"Count to three"}],"max_tokens":16,"stream":true}' | tail -n 2
+          bin/silo --config "$cfg" status
+          test "$(podman container inspect --format '{{.State.Running}}' silo-ci-kill)" = true
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          cat "$RUNNER_TEMP/gateway.log" 2>/dev/null || true
+          podman logs --tail 50 silo-ci-kill 2>/dev/null || true
+
+      - name: Clean up
+        if: always()
+        run: bin/silo --config "$RUNNER_TEMP/silo-kill.toml" down || true
