@@ -19,7 +19,9 @@ ctx_size = 4096
 extra_args = []
 
 [runtime]
-# Pin both images by digest: run `silo pull` and paste what it prints. silo never pulls at launch.
+# Pin both images by image ID: run `silo images` and paste the two "sha256:..." IDs it prints.
+# An ID stays the same when an image is moved with `podman save` / `podman load`; a registry digest
+# does not. silo never pulls at launch.
 image = "ghcr.io/ggml-org/llama.cpp:server"
 probe_image = "docker.io/library/python:3.13-slim"
 # Hard memory cap for the sandbox (no swap on top). Must fit the model plus context.

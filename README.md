@@ -313,6 +313,9 @@ The defaults favour getting a model running. Once yours runs cleanly:
 4. Apply the host firewall rule and the kernel settings in [host/](host/README.md). They need root
    and are the layers that still stand if something gets out of the container.
 5. Set `gateway.api_key_env` if other users or untrusted processes share the machine.
+6. Put a second boundary around all of it: [a VM with no network device](#in-a-local-vm) on your
+   own machine, or [a dedicated, sealed server](#on-a-vps). Everything above narrows the way to a
+   kernel exploit. This is the step that limits what one would reach.
 
 `silo doctor` lists whichever of these are still open.
 
