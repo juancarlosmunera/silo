@@ -158,8 +158,8 @@ CPU_ONLY_DENY: dict[str, str] = {
 # Argument allowlists, applied on CPU-only sandboxes (GPU userspace drivers issue device ioctls that
 # cannot be enumerated here). Each maps an argument index to the values allowed; everything else is
 # denied. The values are what llama-server and the probe runner (CPython) were measured using under
-# strace, plus a few read-only or self-directed operations that runtimes commonly issue.
-# Numbers are the asm-generic ones, identical on x86_64 and aarch64.
+# strace, on x86_64 and on aarch64, plus a few read-only or self-directed operations that runtimes
+# commonly issue. Numbers are the asm-generic ones, identical on both architectures.
 IOCTL_ALLOW: dict[int, str] = {
     0x5401: "TCGETS: isatty() and terminal checks (ENOTTY on anything that is not a tty)",
     0x802C542A: "TCGETS2: isatty() in newer glibc",
@@ -178,6 +178,7 @@ PRCTL_ALLOW: dict[int, str] = {
     15: "PR_SET_NAME: thread names", 16: "PR_GET_NAME",
     21: "PR_GET_SECCOMP", 23: "PR_CAPBSET_READ", 30: "PR_GET_TIMERSLACK", 37: "PR_GET_CHILD_SUBREAPER",
     38: "PR_SET_NO_NEW_PRIVS (can only tighten)", 39: "PR_GET_NO_NEW_PRIVS", 42: "PR_GET_THP_DISABLE",
+    51: "PR_SVE_GET_VL: aarch64 only, reads the SVE vector length (llama-server, to pick its code path)",
     52: "PR_GET_SPECULATION_CTRL",
 }
 SOL_SOCKET, IPPROTO_TCP = 1, 6
