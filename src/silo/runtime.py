@@ -15,8 +15,8 @@ import threading
 import time
 from pathlib import Path
 
-from silo import intake, sandbox, seccomp
-from silo.config import Config, ConfigError, memory_bytes, runtime_root
+from silo import apparmor, intake, sandbox, seccomp
+from silo.config import Config, ConfigError, memory_bytes, runtime_root, state_root
 from silo.gateway import UnixHTTPConnection, runtime_dialer, runtime_path
 from silo.util import safe_text
 
@@ -125,6 +125,26 @@ def server_command(cfg: Config) -> list[str]:
 
 
 # --------------------------------------------------------------------------------------- host prep
+
+def oci_runtime_path() -> str:
+    """The OCI runtime Podman uses by default (crun, runc), as an absolute path."""
+    res = run(["podman", "info", "--format", "{{.Host.OCIRuntime.Path}}"], check=False)
+    path = res.stdout.strip()
+    if res.returncode != 0 or not path.startswith("/") or not os.access(path, os.X_OK):
+        raise LaunchError(f"cannot find Podman's OCI runtime ({safe_text(path or res.stderr.strip())})")
+    return path
+
+
+def apparmor_runtime(cfg: Config) -> Path | None:
+    """silo's OCI runtime wrapper, if the sandbox is to be confined by silo's AppArmor profile.
+
+    That is the case when the profile is loaded (root does that once, see host/apparmor) and the
+    sandbox runs on the host kernel. On gVisor a host profile does not reach the workload.
+    """
+    if gvisor(cfg) or not apparmor.profile_loaded():
+        return None
+    return apparmor.install_wrapper(state_root() / "oci", oci_runtime_path())
+
 
 def exec_lock(cfg: Config) -> bool:
     """Whether execve is decided by silo's supervisor (silo.execlock) for this sandbox.
@@ -418,6 +438,7 @@ def up(cfg: Config, verify: bool = True, full_verify: bool = False) -> None:
         gpu=cfg.runtime.gpu,
         umask="0000" if gvisor(cfg) else "0022",  # the host-side socket must be connectable by this user
         remove=False,  # keep logs of a failed start; `silo down` / the next `silo up` removes it
+        oci_runtime=apparmor_runtime(cfg),
     )
     deadline = time.monotonic() + cfg.runtime.startup_timeout
     lock = GvisorSocketLock(cfg, deadline) if gvisor(cfg) else None
@@ -510,6 +531,7 @@ def status(cfg: Config) -> dict:
         "reached_through": "locked socket directory" if gvisor(cfg) else "connector",
         "reachable": reachable,
         "health": health(cfg) if running and reachable else None,
+        "apparmor_profile": apparmor.PROFILE if not gvisor(cfg) and apparmor.profile_loaded() else None,
         "exec_lock": exec_lock_state(cfg),
         "execs_refused": execs_refused(cfg.socket_dir) if exec_lock(cfg) else None,
         "image": cfg.runtime.image,
@@ -566,6 +588,7 @@ def probe(cfg: Config, baseline: bool = False) -> tuple[int, list[dict]]:
         args = scoped(cfg, sandbox.podman_run_args(
             cfg, name=f"{cfg.container_name}-probe", image=image, command=["python3", "-I", "-", *flags],
             seccomp_profile=profile, mounts=mounts, interactive=True, memory="512m", gpu=cfg.runtime.gpu,
+            oci_runtime=apparmor_runtime(cfg),
         ), memory="512m")
     try:
         if scratch and exec_lock(cfg):
