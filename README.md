@@ -46,7 +46,7 @@ network. A model only produces text. For it to reach the net, one of these has t
 | | Route | What silo does about it |
 |---|---|---|
 | 1 | **Someone hands it a tool.** Web fetch, shell or code execution, wired up by an agent framework or a runtime flag. By far the most common way. | Refuses the llama-server flags that enable tools, agents, MCP, remote backends and downloads. The gateway refuses tool calling unless you turn it on. The model can only return text. |
-| 2 | **Code runs inside the runtime.** A crafted model file exploits the loader, or a pickle checkpoint executes on load. | Intake rejects pickles, code and anything that is not a vetted format. The runtime has no network device, cannot create an internet socket, cannot create namespaces to get around either, holds no privileges and has nowhere to put a binary. |
+| 2 | **Code runs inside the runtime.** A crafted model file exploits the loader, or a pickle checkpoint executes on load. | Intake rejects pickles, code and anything that is not a vetted format. The runtime has no network device, cannot create an internet socket, cannot create namespaces to get around either, holds no privileges, has nowhere to put a binary and cannot start another program. |
 | 3 | **Its text gets someone else to do it.** "Run this command", or an image link that your chat UI fetches on its own. | The gateway re-serialises, scans and logs every completion, and can withhold the obvious cases. |
 
 Routes 1 and 2 are closed by construction and checked by a test suite you can run yourself.
@@ -61,6 +61,7 @@ first item under [Limits](#limits).
 | **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. |
 | **Privilege** | Rootless Podman, so container root is not host root. The runtime runs as `nobody`, mapped to a subordinate UID that owns nothing on the host. Every capability dropped, bounding set included. `no-new-privileges`. SELinux `container_t` with per-container categories. |
 | **Filesystem, persistence** | Read-only root. Model directory mounted read-only. The only writable location is a 64 MB `noexec` tmpfs. No `memfd_create` on CPU-only sandboxes, so no fileless exec either. Environment stripped. No Podman, D-Bus, display, audio or agent sockets visible. |
+| **Running other programs** | Once the runtime has started, nothing else can be executed in the sandbox. Every `execve` is put to a supervisor on the host, which lets the container's own first one through and refuses the rest. The shell, `curl` and Python that ship in the runtime image are of no use to a compromised runtime, and neither is a binary it brought along. Not available on gVisor. |
 | **The runtime's socket** | No host directory is shared with the sandbox. llama-server listens on an abstract UNIX socket, which exists only inside its own network namespace; a small connector started through `podman unshare` joins that namespace, drops every capability and hands each connection to the gateway, which checks the peer is the sandbox's UID. |
 | **Resources** | Memory cap with no swap, PID cap, file-descriptor cap, size-capped log. |
 | **Model files** | `silo intake`: format allowlist (GGUF, safetensors), magic-byte checks, no pickles, code or symlinks, and a SHA-256 manifest kept outside the model directory and checked before every launch. |
@@ -73,15 +74,15 @@ The reasoning behind each control, and what is left over, is in
 ## Check it yourself
 
 None of the above is taken on trust. `silo probe` starts a sandbox with exactly the flags the model
-gets and runs 66 probes inside it: reach the network through a dozen socket types, create
-namespaces, call the kernel interfaces listed above, find a location that is both writable and
+gets and runs 67 probes inside it: reach the network through a dozen socket types, create
+namespaces, call the kernel interfaces listed above, start a second program, find a location that is both writable and
 executable, find host sockets and credentials, and check the process's own privileges and limits.
 `silo probe --baseline` runs the same probes in a stock rootless Podman container.
 
 | | stock rootless Podman | silo |
 |---|---|---|
-| contained (PASS) | 26 | 66 |
-| not contained (FAIL) | 32 | 0 |
+| contained (PASS) | 26 | 67 |
+| not contained (FAIL) | 33 | 0 |
 | weaker than intended (WARN) | 7 | 0 |
 
 These are the numbers from the development machine. One probe is skipped in the baseline because
@@ -168,7 +169,7 @@ silo probe      # run the escape probes in a sandbox identical to the model's
  PASS sys.unshare                    unshare(CLONE_NEWUSER): refused (EPERM)
  PASS fs.writable_noexec             writable locations ['/tmp'] are all noexec
  ...
-PASS=66  FAIL=0  WARN=0  SKIP=0
+PASS=67  FAIL=0  WARN=0  SKIP=0
 ```
 
 **4. Start it.**
@@ -180,7 +181,7 @@ silo up
 ```
 silo[default] config: /home/you/.config/silo/silo.toml
 silo[default] starting silo-default from ghcr.io/ggml-org/llama.cpp:server
-silo[default] model healthy, reached through /run/user/1000/silo/default/control.sock (connector; no shared directory)
+silo[default] model healthy, reached through /run/user/1000/silo/default/control.sock (connector; no shared directory; exec lock on)
 silo[default] gateway on http://127.0.0.1:8088/v1  ->  /run/user/1000/silo/default/control.sock (connector)
 silo[default] scanner=monitor tools=refused audit=/home/you/.local/state/silo/audit/default.jsonl
 ```
@@ -251,8 +252,8 @@ an unprivileged UID with no capabilities. silo's own controls, its seccomp profi
 apply inside, and the escape probes pass there.
 
 It is a trade, not a free addition: SELinux does not confine a gVisor sandbox, one directory is
-shared with it for the runtime's socket, and inference was about 20% slower in a quick test (8% on
-gVisor's KVM platform). [docs/GVISOR.md](docs/GVISOR.md) has the installation, what silo asks of
+shared with it for the runtime's socket, the exec lock is not available there, and inference was
+about 20% slower in a quick test (8% on gVisor's KVM platform). [docs/GVISOR.md](docs/GVISOR.md) has the installation, what silo asks of
 gVisor and why, and the measurements.
 
 ## Commands
@@ -288,6 +289,7 @@ The settings that matter most. Every option, with comments, is in
 | `runtime.memory` | `"8g"` | Hard memory cap, with no swap on top. It has to fit the model plus its context. |
 | `runtime.seccomp_action` | `"errno"` | `"errno"` makes denied syscalls fail. `"kill"` terminates the runtime on the first one. |
 | `runtime.image` | llama.cpp server | Pin it with the image ID printed by `silo images`. |
+| `runtime.exec_lock` | `true` | After the runtime has started, refuse every `execve` in the sandbox. Turn it off only for an image whose entrypoint is a wrapper that starts the real server. |
 | `runtime.runsc` | none | Path to gVisor's `runsc`: run the sandbox on gVisor's user-space kernel. See [docs/GVISOR.md](docs/GVISOR.md). |
 | `runtime.gvisor_platform` | `"systrap"` | With `runsc`: `"systrap"` works everywhere, `"kvm"` is faster and hands `/dev/kvm` to gVisor. |
 | `runtime.gpu` | `"none"` | GPU passthrough. Exposes a GPU driver to the sandbox and is not yet verified. |
@@ -382,6 +384,7 @@ src/silo/sandbox.py     the podman flags, and the check that refuses to launch w
 src/silo/seccomp.py     profile hardening, with the reason for every denied syscall
 src/silo/gateway.py     the host-side proxy
 src/silo/connector.py   reaches the runtime's socket inside the sandbox's network namespace
+src/silo/execlock.py    the supervisor that refuses every execve after the runtime's own
 src/silo/scanner.py     output tripwire rules
 src/silo/intake.py      model-directory vetting and manifest
 src/silo/runtime.py     lifecycle: launch, connector, probes

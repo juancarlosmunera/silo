@@ -248,6 +248,78 @@ class RunDirTests(unittest.TestCase):
         self.assertFalse(any(line.startswith(("from silo", "import silo")) for line in script.splitlines()))  # runs from source under `podman unshare`, outside the package
 
 
+class ExecLockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.tmp.name, "XDG_STATE_HOME": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_where_the_lock_applies(self):
+        cfg = cfg_with()
+        self.assertTrue(runtime.exec_lock(cfg))                 # on by default
+        cfg.runtime.exec_lock = False
+        self.assertFalse(runtime.exec_lock(cfg))
+        gv = gvisor_cfg()
+        self.assertTrue(gv.runtime.exec_lock)
+        self.assertFalse(runtime.exec_lock(gv))                 # gVisor has no seccomp user notification
+
+    def test_profile_names_the_supervisor_of_this_sandbox(self):
+        base = Path(self.tmp.name) / "base.json"
+        base.write_text('{"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [{"names": ["read", "execve"], '
+                        '"action": "SCMP_ACT_ALLOW"}]}')
+        cfg = cfg_with()
+        cfg.runtime.seccomp_base = base
+        import json
+        model = json.loads(runtime.prepare_seccomp(cfg, exec_dir=cfg.socket_dir).read_text())
+        self.assertEqual(model["listenerPath"], str(cfg.socket_dir / "exec.sock"))
+        scratch = Path(self.tmp.name) / "silo" / "probe-abc"
+        probe = json.loads(runtime.prepare_seccomp(cfg, exec_dir=scratch, probe=True).read_text())
+        self.assertEqual(probe["listenerPath"], str(scratch / "exec.sock"))
+        # a probe run must not rewrite the profile a running model was started with
+        self.assertNotEqual(cfg.seccomp_path, cfg.probe_seccomp_path)
+        self.assertEqual(json.loads(cfg.seccomp_path.read_text())["listenerPath"], model["listenerPath"])
+        self.assertNotIn("listenerPath", json.loads(runtime.prepare_seccomp(cfg).read_text()))
+
+    def test_refusals_are_counted_from_the_supervisor_log(self):
+        directory = Path(self.tmp.name)
+        self.assertEqual(runtime.execs_refused(directory), 0)  # no log: nothing refused
+        (directory / runtime.EXEC_LOG).write_text(
+            "execlock: ready, pid 10\nexeclock: supervising, container pid 11, uid 65532, errno mode (no capabilities)\n"
+            "execlock: execve #2 by pid 12 (syscall 59): refused (EPERM)\n"
+            "execlock: execve #3 by pid 12 (syscall 322): refused (EPERM)\n")
+        self.assertEqual(runtime.execs_refused(directory), 2)
+
+    def test_state_shown_by_status(self):
+        cfg = cfg_with()
+        self.assertEqual(runtime.exec_lock_state(cfg), "on (supervisor not running)")
+        cfg.socket_dir.mkdir(parents=True)
+        (cfg.socket_dir / runtime.EXEC_PIDFILE).write_text(f"{os.getpid()}\n")
+        self.assertEqual(runtime.exec_lock_state(cfg), "on")
+        cfg.runtime.exec_lock = False
+        self.assertIn("off", runtime.exec_lock_state(cfg))
+        self.assertIn("gVisor", runtime.exec_lock_state(gvisor_cfg()))
+
+    def test_supervisor_script_is_packaged_and_standalone(self):
+        script = runtime.execlock_script()
+        compile(script, "execlock.py", "exec")
+        self.assertFalse(any(line.startswith(("from silo", "import silo")) for line in script.splitlines()))
+
+    def test_exit_hint_names_the_lock(self):
+        cfg = cfg_with()
+        cfg.socket_dir.mkdir(parents=True)
+        (cfg.socket_dir / runtime.EXEC_LOG).write_text("execlock: execve #2 by pid 12 (syscall 59): killed\n")
+        inspect = mock.Mock(stdout="137 false\n")
+        with mock.patch.object(runtime, "run", return_value=inspect):
+            self.assertIn("killed by silo's exec lock", runtime._exit_hint(cfg))
+            inspect.stdout = "126 false\n"
+            self.assertIn("exec lock refused an execve", runtime._exit_hint(cfg))
+            self.assertIn("runtime.exec_lock = false", runtime._exit_hint(cfg))
+            (cfg.socket_dir / runtime.EXEC_LOG).write_text("execlock: ready, pid 10\n")
+            self.assertEqual(runtime._exit_hint(cfg), "exit code 126")   # nothing refused: not the lock's doing
+
+
 class EarlyExitTests(unittest.TestCase):
     def test_a_runtime_that_died_is_reported_with_its_reason(self):
         cfg = Config(name="t")

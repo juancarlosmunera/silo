@@ -36,6 +36,10 @@ seccomp_action = "errno"
 gpu = "none"
 # seccomp_base = "/usr/share/containers/seccomp.json"
 startup_timeout = 600.0
+# After the runtime has started, refuse every execve in the sandbox: the shell and tools in the image
+# become unusable to a compromised runtime. Turn it off only for an image whose entrypoint is a
+# wrapper that starts the real server. Not available with runsc.
+exec_lock = true
 # gVisor: run the sandbox on a user-space kernel, so that the runtime's system calls no longer reach
 # this machine's kernel directly. The trade: SELinux does not confine a gVisor sandbox, one directory
 # is shared with it for the runtime's socket, and inference is somewhat slower. runsc must be installed

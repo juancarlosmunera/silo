@@ -221,6 +221,19 @@ class RunChecksTests(unittest.TestCase):
         self.assertEqual(with_gvisor["LSM"].level, doctor.WARN)
         self.assertEqual(self.run_checks(None, None, podman=podman)["LSM"].level, doctor.BAD)
 
+    def test_exec_lock(self):
+        from silo.config import Config
+        self.assertEqual(self.run_checks(None, None)["exec lock"].level, doctor.OK)
+        off = Config()
+        off.runtime.exec_lock = False
+        check = self.run_checks(None, None, cfg=off)["exec lock"]
+        self.assertEqual(check.level, doctor.WARN)
+        self.assertIn("runtime.exec_lock = true", check.fix)
+        gvisor = self.run_checks(None, None, cfg=self.gvisor_cfg(), tools=("podman", "systemd-run"),
+                                 runsc_version="release-1")["exec lock"]
+        self.assertEqual(gvisor.level, doctor.WARN)
+        self.assertIn("not available on gVisor", gvisor.detail)
+
     def test_installed_runsc_is_pointed_out_when_not_configured(self):
         checks = self.run_checks(None, None, tools=("podman", "runsc"))
         self.assertIn('runtime.runsc = "/usr/bin/runsc"', checks["kernel isolation"].fix)

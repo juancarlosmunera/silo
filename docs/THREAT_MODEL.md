@@ -28,8 +28,8 @@ What has to be correct for the above to hold:
 
 - the host kernel (namespaces, seccomp, cgroups, SELinux enforcement);
 - Podman, crun and conmon, and the SELinux container policy;
-- silo's launcher, connector and gateway: about 1,800 lines of Python (`sandbox.py`, `seccomp.py`, `runtime.py`, `connector.py`,
-  `gateway.py`), standard library only;
+- silo's launcher, connector, exec supervisor and gateway: about 2,100 lines of Python (`sandbox.py`,
+  `seccomp.py`, `runtime.py`, `connector.py`, `execlock.py`, `gateway.py`), standard library only;
 - the base seccomp profile shipped by the distribution, which silo tightens but does not replace;
 - with `runtime.runsc`: gVisor (`runsc`, its sentry and its gofer), which then stands where the host
   kernel's system call interface stood, and without SELinux around it;
@@ -101,6 +101,42 @@ emptied. Verified by `fs.*`, `proc.environment`, `host.secrets`.
 `noexec` raises the cost of running a dropped binary; it does not stop code execution inside an
 already compromised process, which can still map executable memory.
 
+### Running other programs
+
+The runtime image is not empty. llama.cpp's ships a shell, `curl` and a Python interpreter, and a
+runtime that has been taken over could run any of them, or something it carried in. `noexec` only
+covers the one place a new file could be written.
+
+Once the runtime has started, nothing else can be executed. A seccomp filter cannot express that
+by itself: it is fixed before the container's entrypoint is executed, and would have to count. So
+silo's profile hands `execve` and `execveat` to a supervisor on the host (`silo/execlock.py`)
+through seccomp's user notification: the kernel suspends the caller and asks. The container
+runtime passes the supervisor the notification descriptor together with the PID of the
+container's first process, and the supervisor:
+
+- lets exactly one call continue: the first, and only if that process makes it. That is the
+  runtime executing the image's entrypoint, before any code from the image has run;
+- refuses every later one with `EPERM`, or with `seccomp_action = "kill"` kills the process that
+  made it, as a seccomp kill would;
+- writes each refusal to the audit log (`"event": "exec_refused"`).
+
+The decision depends only on which call it is, never on its arguments, so the known weakness of
+continuing a notified system call (the caller can change the arguments after they were looked at)
+has nothing to act on. If the supervisor dies, the kernel answers every `execve` with `ENOSYS`: the
+lock fails closed. The supervisor runs as an unprivileged UID of the user namespace with no
+capabilities, or with `CAP_KILL` alone in kill mode. Once it holds the descriptor it removes its
+socket, so `podman exec` into the sandbox is refused by the container runtime as well.
+
+What it does not do: code already running inside the runtime can still do whatever the runtime
+could, in its own process. The lock takes away the tools around it, and in kill mode turns the
+most common second step of an exploit, starting a shell, into the runtime's death.
+
+Verified by `proc.exec_locked`, and by a unit test that runs the supervisor against a real
+notification descriptor. It is on by default; `runtime.exec_lock = false` is for an image whose
+entrypoint is a wrapper that starts the real server, which needs a second `execve`. On GPU
+sandboxes, where `memfd_create` has to stay allowed, the lock is also what stops fileless
+execution (`fs.memfd_exec`). It is not available on gVisor, which has no user notification.
+
 ### The runtime's socket
 
 The gateway has to reach the runtime, but no host directory is shared with the sandbox for it.
@@ -162,6 +198,9 @@ With `runtime.runsc` the same sandbox is started on gVisor's user-space kernel
   directory is shared for the socket. silo locks it (owned by the user, writable by nobody else)
   as soon as the socket appears, fails the launch if anything else is in it, and the gateway checks
   the lock, the socket and the listener's UID on every connection.
+- **Running other programs.** The exec lock is not available: gVisor's seccomp has no user
+  notification and refuses a profile that asks for it. Programs in the image can be executed
+  inside the sandbox, on gVisor's kernel.
 - **Resources.** Rootless `runsc` cannot set up cgroups. silo starts Podman inside a systemd user
   scope that carries the memory, swap, task and CPU limits for the whole gVisor sandbox, and
   refuses to start without one.
@@ -206,8 +245,8 @@ Stated plainly, in rough order of importance.
    missing. `silo doctor` fails such a host and `silo probe` reports it.
 10. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
     delivered. Only `enforce` withholds.
-11. **gVisor sandboxes.** They exchange one layer for another. SELinux does not confine them. The
-    socket directory is shared, and writable from inside from container start until the runtime
+11. **gVisor sandboxes.** They exchange one layer for another. SELinux does not confine them and
+    the exec lock is not available. The socket directory is shared, and writable from inside from container start until the runtime
     has bound its socket: a model file that took over the runtime that early could put files there,
     which fails the launch but could fill the runtime directory for a moment. And gVisor's own
     kernel, with its bugs, is now in the path.
@@ -223,7 +262,6 @@ Stated plainly, in rough order of importance.
 
 - Mandatory access control for the sandbox on AppArmor hosts.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
-- Locking down `execve` after the runtime has started.
 - An origin allowlist with proper CORS handling, for browser-based clients.
 - Tool-call mediation: per-tool policy instead of all-or-nothing.
 - Structural validation of GGUF files at intake.

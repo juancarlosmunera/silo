@@ -35,6 +35,9 @@ RESULTS = []
 GVISOR_REQUESTED = "--gvisor" in sys.argv[1:]
 GVISOR = GVISOR_REQUESTED and "gvisor" in platform.release().lower()
 GVISOR_DEV = {"fuse", "net", "char"}  # emulated inside gVisor's kernel, not host devices
+# The launcher passes --no-exec-lock when execve is not decided by silo's supervisor: switched off in
+# silo.toml, or a gVisor sandbox, where the kernel feature behind it does not exist.
+EXEC_LOCK = "--no-exec-lock" not in sys.argv[1:]
 
 SYSNR = {
     "x86_64": {
@@ -441,6 +444,21 @@ def writable_dirs():
     return found
 
 
+def mount_options(path, mountinfo=None):
+    """Options of the mount that holds `path`: the longest matching mount point, the last one mounted there."""
+    best, options = "", set()
+    try:
+        lines = mountinfo if mountinfo is not None else open("/proc/self/mountinfo").read().splitlines()
+        for line in lines:
+            fields = line.split()
+            target = fields[4]
+            if (path == target or path.startswith(target.rstrip("/") + "/")) and len(target) >= len(best):
+                best, options = target, set(fields[5].split(","))
+    except (OSError, IndexError):
+        pass
+    return options
+
+
 def probe_tmp_noexec():
     # Dropping a binary and running it needs a place that is both writable and executable.
     dirs = writable_dirs()
@@ -451,10 +469,12 @@ def probe_tmp_noexec():
         path = os.path.join(directory, "silo-probe.sh")
         try:
             with open(path, "w") as fh:
-                fh.write("#!/bin/sh\nexit 0\n")
+                fh.write("#!/bin/sh\nexit 42\n")
             os.chmod(path, 0o755)
-            subprocess.run([path], capture_output=True, timeout=5)
-            executable.append(directory)
+            # Only its own exit status proves that it ran: a child killed on the way (seccomp or the
+            # exec lock in kill mode) returns a signal number, and a refused execve raises.
+            if subprocess.run([path], capture_output=True, timeout=5).returncode == 42:
+                executable.append(directory)
         except (OSError, subprocess.SubprocessError):
             pass
         finally:
@@ -464,6 +484,12 @@ def probe_tmp_noexec():
                 pass
     if executable:
         return record("fs.writable_noexec", "FAIL", f"writable and executable: {executable}")
+    # Running the file can also have been refused by the exec lock, which refuses everything. The
+    # mount flag is the layer under it, so it is checked by itself.
+    unflagged = [d for d in dirs if "noexec" not in mount_options(d)]
+    if unflagged:
+        return record("fs.writable_noexec", "WARN", f"writable locations without noexec: {unflagged} "
+                                                    "(a file dropped there did not run, but not because of the mount)")
     record("fs.writable_noexec", "PASS", f"writable locations {dirs} are all noexec")
 
 
@@ -484,6 +510,8 @@ def probe_memfd_exec():
             rc = subprocess.run([f"/proc/self/fd/{fd}"], pass_fds=(fd,), timeout=5).returncode
         except OSError as exc:
             return ["exec_refused", errno.errorcode.get(exc.errno, exc.errno)]
+        if rc < 0:  # killed on its way into execve (the exec lock in kill mode): the copy never ran
+            return ["exec_killed", signal.Signals(-rc).name]
         return ["executed", rc]
 
     kind, value = in_child(attempt)
@@ -590,6 +618,47 @@ def probe_gvisor():
     if GVISOR:
         return record("kernel.gvisor", "PASS", f"running on gVisor's user-space kernel ({platform.release()})")
     record("kernel.gvisor", "FAIL", f"the launcher asked for gVisor but the kernel is {platform.release()}")
+
+
+def probe_exec_lock():
+    """After the sandbox's first program has started, can another one be executed?"""
+    target = next((p for p in ("/bin/true", "/usr/bin/true", "/bin/sh") if os.path.exists(p)), None)
+    if target is None:
+        return record("proc.exec_locked", "SKIP", "no program to try in this image")
+
+    def attempt():
+        try:
+            os.execv(target, [target])
+        except OSError as exc:
+            return errno.errorcode.get(exc.errno, str(exc.errno))
+
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child: either becomes `target` and exits 0, or reports why it could not
+        os.close(rfd)
+        signal.alarm(8)
+        os.write(wfd, (attempt() or "").encode())
+        os._exit(3)
+    os.close(wfd)
+    refused = os.read(rfd, 64).decode()
+    os.close(rfd)
+    _, status = os.waitpid(pid, 0)
+    if os.WIFSIGNALED(status):
+        outcome = f"the process was killed ({signal.Signals(os.WTERMSIG(status)).name})"
+        contained = os.WTERMSIG(status) in (signal.SIGKILL, signal.SIGSYS)
+    elif refused:
+        outcome, contained = f"refused ({refused})", True
+    else:
+        outcome, contained = "it ran", False
+    if contained:
+        return record("proc.exec_locked", "PASS", f"execve of {target}: {outcome}")
+    if GVISOR:
+        return record("proc.exec_locked", "INFO", f"execve of {target}: {outcome}. silo's exec lock needs seccomp "
+                                                  "user notification, which gVisor does not have")
+    if not EXEC_LOCK:
+        return record("proc.exec_locked", "WARN", f"execve of {target}: {outcome}. The exec lock is off "
+                                                  "(runtime.exec_lock = false): programs in the image can be run")
+    record("proc.exec_locked", "FAIL", f"execve of {target}: {outcome}. Nothing stops a program in the image from being started")
 
 
 def probe_lsm():
@@ -717,8 +786,8 @@ def main():
     for fn in (probe_gvisor, probe_interfaces, probe_routes, probe_socket_families, probe_socketpair, probe_dns,
                probe_tcp_egress, probe_abstract_unix, probe_syscalls, probe_clone_newuser, probe_compat_abi,
                probe_readonly, probe_socket_dir, probe_tmp_noexec, probe_memfd_exec, probe_mounts,
-               probe_host_artifacts, probe_credentials, probe_pid_namespace, probe_lsm, probe_environment,
-               probe_cgroup_limits, probe_devices, probe_pty, probe_kernel_leaks):
+               probe_host_artifacts, probe_credentials, probe_pid_namespace, probe_exec_lock, probe_lsm,
+               probe_environment, probe_cgroup_limits, probe_devices, probe_pty, probe_kernel_leaks):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001 - a crashing probe must not hide the others

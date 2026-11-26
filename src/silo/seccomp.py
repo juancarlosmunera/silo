@@ -152,6 +152,10 @@ CPU_ONLY_DENY: dict[str, str] = {
 # Removed from the base profile and re-added below with silo's own argument conditions.
 REPLACED = {"socket", "socketpair", "clone"}
 
+# With the exec lock (silo.execlock) these are neither allowed nor denied by the filter: the kernel
+# suspends the caller and asks silo's supervisor, which lets the container's first one through.
+EXEC_SYSCALLS = ("execve", "execveat")
+
 
 def _deny(action: str, errno: int) -> dict:
     if action == "kill":
@@ -163,8 +167,13 @@ def _arg(index: int, value: int, op: str, value_two: int = 0) -> dict:
     return {"index": index, "value": value, "valueTwo": value_two, "op": op}
 
 
-def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_only: bool = True) -> dict:
-    """Return a hardened copy of an OCI/containers seccomp profile."""
+def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_only: bool = True,
+           exec_listener: Path | None = None) -> dict:
+    """Return a hardened copy of an OCI/containers seccomp profile.
+
+    With `exec_listener` (the socket silo's exec supervisor listens on), execve and execveat are
+    decided by that supervisor instead of being allowed.
+    """
     if action not in ("errno", "kill"):
         raise ValueError("action must be 'errno' or 'kill'")
     machine = machine or platform.machine()
@@ -181,7 +190,7 @@ def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_on
     profile["defaultErrnoRet"] = ENOSYS
 
     deny = dict(DENY, **(CPU_ONLY_DENY if cpu_only else {}))
-    strip = set(deny) | set(FORCE_ENOSYS) | REPLACED
+    strip = set(deny) | set(FORCE_ENOSYS) | REPLACED | (set(EXEC_SYSCALLS) if exec_listener else set())
     rules = []
     for rule in profile.get("syscalls", []):
         names = [n for n in rule.get("names", []) if n not in strip]
@@ -227,6 +236,15 @@ def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_on
         "errnoRet": ENOSYS,
         "comment": "silo: force libc fallback to filterable syscalls",
     })
+    profile.pop("listenerPath", None)
+    profile.pop("listenerMetadata", None)
+    if exec_listener:
+        rules.append({
+            "names": list(EXEC_SYSCALLS),
+            "action": "SCMP_ACT_NOTIFY",
+            "comment": "silo: exec lock, decided by the supervisor (first exec of the container only)",
+        })
+        profile["listenerPath"] = str(exec_listener)
     profile["syscalls"] = rules
     return profile
 
@@ -243,9 +261,10 @@ def allowed_unconditionally(profile: dict) -> set[str]:
     return out
 
 
-def write_profile(base_path: Path, out_path: Path, action: str = "errno", cpu_only: bool = True) -> Path:
+def write_profile(base_path: Path, out_path: Path, action: str = "errno", cpu_only: bool = True,
+                  exec_listener: Path | None = None) -> Path:
     base = json.loads(base_path.read_text())
-    profile = harden(base, action=action, cpu_only=cpu_only)
+    profile = harden(base, action=action, cpu_only=cpu_only, exec_listener=exec_listener)
     out_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = out_path.with_suffix(".tmp")
     tmp.write_text(json.dumps(profile, indent=2) + "\n")

@@ -15,7 +15,7 @@ FIXTURE = {
     "syscalls": [
         {"names": ["read", "write", "clone", "clone3", "unshare", "socket", "socketpair", "socketcall", "ptrace",
                    "mount", "keyctl", "memfd_create", "io_uring_setup", "msgget", "msgsnd", "splice", "vmsplice",
-                   "io_setup", "mq_open", "futex", "mmap"], "action": "SCMP_ACT_ALLOW",
+                   "io_setup", "mq_open", "futex", "mmap", "execve", "execveat"], "action": "SCMP_ACT_ALLOW",
          "args": [], "includes": {}, "excludes": {}},
         {"names": ["bpf"], "action": "SCMP_ACT_ALLOW", "args": [], "includes": {"caps": ["CAP_SYS_ADMIN"]}},
         {"names": ["socket"], "action": "SCMP_ACT_ALLOW", "args": [{"index": 0, "value": 16, "op": "SCMP_CMP_NE"}],
@@ -103,6 +103,32 @@ class HardenTests(unittest.TestCase):
         p = self.harden(cpu_only=False)
         self.assertIn("memfd_create", seccomp.allowed_unconditionally(p))
         self.assertNotIn("memfd_create", seccomp.allowed_unconditionally(self.harden()))
+
+    def test_exec_lock(self):
+        listener = Path("/run/user/1000/silo/default/exec.sock")
+        for action in ("errno", "kill"):
+            p = self.harden(action=action, exec_listener=listener)
+            self.assertEqual(p["listenerPath"], str(listener))
+            for name in seccomp.EXEC_SYSCALLS:
+                rules = rules_for(p, name)
+                self.assertEqual([r["action"] for r in rules], ["SCMP_ACT_NOTIFY"], name)
+                self.assertNotIn(name, seccomp.allowed_unconditionally(p))
+        # the supervisor decides, in kill mode too: the entrypoint's own exec must not be killed by the filter
+        self.assertFalse(any(r["action"] == "SCMP_ACT_KILL_PROCESS" and set(r["names"]) & set(seccomp.EXEC_SYSCALLS)
+                             for r in self.harden(action="kill", exec_listener=listener)["syscalls"]))
+
+    def test_without_the_exec_lock_nothing_is_notified(self):
+        p = self.harden()
+        self.assertNotIn("listenerPath", p)
+        self.assertFalse(any(r["action"] == "SCMP_ACT_NOTIFY" for r in p["syscalls"]))
+
+    def test_a_listener_in_the_base_profile_is_not_inherited(self):
+        base = {**FIXTURE, "listenerPath": "/somewhere/else.sock", "listenerMetadata": "x"}
+        p = seccomp.harden(base, machine="x86_64")
+        self.assertNotIn("listenerPath", p)
+        self.assertNotIn("listenerMetadata", p)
+        p = seccomp.harden(base, machine="x86_64", exec_listener=Path("/run/silo-exec.sock"))
+        self.assertEqual(p["listenerPath"], "/run/silo-exec.sock")
 
     def test_base_profile_not_mutated(self):
         before = json.dumps(FIXTURE, sort_keys=True)

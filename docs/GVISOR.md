@@ -32,6 +32,9 @@ The cost:
   another. On a host without SELinux, such as Ubuntu, nothing is lost.
 - **One directory is shared with the sandbox again**, for the runtime's socket. See
   [The socket](#the-socket).
+- **No exec lock.** Refusing every `execve` after the runtime's own needs seccomp's user
+  notification, which gVisor does not have (it rejects such a profile). A compromised runtime can
+  run the programs in its image, inside gVisor.
 - **Speed.** About 20% slower here, or 8% on gVisor's KVM platform. See [Speed](#speed).
 - **No GPU.** silo refuses `runtime.gpu` together with `runtime.runsc`.
 - **gVisor joins what has to be correct**, and what you keep up to date.
@@ -104,9 +107,9 @@ warns that SELinux does not confine this sandbox:
  PASS fs.socket_dir_locked   shared socket directory is not writable (Permission denied)
 ```
 
-Two are reported as information, because what they look at is not visible from inside gVisor:
-`proc.lsm` (no host LSM reaches the sandbox) and `proc.cgroup_limits` (the limits sit on the host,
-around gVisor).
+Three are reported as information: `proc.lsm` (no host LSM reaches the sandbox),
+`proc.cgroup_limits` (the limits sit on the host, around gVisor, and cannot be seen from inside)
+and `proc.exec_locked` (the exec lock does not exist on gVisor).
 
 ## 4. Run it
 

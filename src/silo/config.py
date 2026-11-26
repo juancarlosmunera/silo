@@ -77,6 +77,7 @@ class RuntimeConfig:
     seccomp_action: str = "errno"  # errno | kill
     seccomp_base: Path = DEFAULT_SECCOMP_BASE
     startup_timeout: float = 600.0
+    exec_lock: bool = True  # after the runtime has started, nothing else can be executed in the sandbox
     runsc: Path | None = None  # gVisor's runsc binary: run the sandbox on gVisor's user-space kernel
     gvisor_platform: str = "systrap"  # systrap | kvm
 
@@ -143,6 +144,11 @@ class Config:
     @property
     def seccomp_path(self) -> Path:
         return state_root() / "seccomp" / f"{self.name}.json"
+
+    @property
+    def probe_seccomp_path(self) -> Path:
+        """The probes' own copy of the profile: it names a different exec supervisor than the model's."""
+        return state_root() / "seccomp" / f"{self.name}-probe.json"
 
     def require_model(self) -> tuple[Path, str]:
         if self.model.dir is None or self.model.file is None:

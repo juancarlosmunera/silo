@@ -60,5 +60,23 @@ class SharedDirectoryTests(unittest.TestCase):
         self.assertEqual(shared(line), [])
 
 
+class MountOptionTests(unittest.TestCase):
+    def options(self, path, extra=""):
+        return probes.mount_options(path, (SILO_MOUNTS + extra).splitlines())
+
+    def test_the_mount_that_holds_the_path(self):
+        self.assertIn("noexec", self.options("/tmp"))
+        self.assertIn("noexec", self.options("/tmp/some/dropped/file"))
+        self.assertNotIn("noexec", self.options("/usr/local/bin"))   # the root filesystem
+        self.assertEqual(self.options("/tmpfoo"), self.options("/"))  # a name that merely starts like a mount point
+
+    def test_the_last_mount_on_a_path_wins(self):
+        remounted = "1180 925 0:90 / /tmp rw,nosuid,nodev,relatime - tmpfs tmpfs rw\n"
+        self.assertNotIn("noexec", self.options("/tmp", remounted))
+
+    def test_unreadable_table_means_no_flags(self):
+        self.assertEqual(probes.mount_options("/tmp", ["garbage"]), set())
+
+
 if __name__ == "__main__":
     unittest.main()

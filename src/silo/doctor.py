@@ -245,6 +245,16 @@ def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
     else:
         add(Check("seccomp action", WARN, "errno: denied syscalls fail quietly, so a compromised runtime can "
                   "keep probing", 'runtime.seccomp_action = "kill" once your model runs cleanly'))
+    if cfg.runtime.runsc is not None:
+        add(Check("exec lock", WARN, "not available on gVisor (it has no seccomp user notification): programs in "
+                  "the image can be executed inside the sandbox", "this is part of the trade for the second kernel "
+                  "(docs/GVISOR.md)"))
+    elif cfg.runtime.exec_lock:
+        add(Check("exec lock", OK, "on: once the runtime has started, nothing else can be executed in the sandbox"))
+    else:
+        add(Check("exec lock", WARN, "off: the shell, interpreters and tools in the image can be executed by a "
+                  "compromised runtime", "runtime.exec_lock = true, unless the image's entrypoint is a wrapper "
+                  "that starts the real server"))
     if cfg.gateway.scanner == "enforce":
         add(Check("output scanner", OK, "enforce: high-severity completions are withheld"))
     else:

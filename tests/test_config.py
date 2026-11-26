@@ -49,6 +49,8 @@ class ConfigTests(unittest.TestCase):
             '[gateway]\nallow_tools = 1\n',
             '[gateway]\nallow_tools = "false"\n',
             '[runtime]\npids_limit = 64.5\n',
+            '[runtime]\nexec_lock = "yes"\n',
+            '[runtime]\nexec_lock = 0\n',
             '[model]\nextra_args = "--jinja"\n',
             '[model]\nextra_args = ["--threads", 4]\n',
             '[gateway]\nport = 0\n',
@@ -132,6 +134,8 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(cfg.gateway.log_content)
         self.assertEqual(cfg.gateway.scanner, "monitor")
         self.assertEqual(cfg.runtime.gpu, "none")
+        self.assertTrue(cfg.runtime.exec_lock)
+        self.assertFalse(config.load(write('[runtime]\nexec_lock = false\n')).runtime.exec_lock)
 
     def test_types_are_coerced_only_where_safe(self):
         cfg = config.load(write('[runtime]\ncpus = 4\nimage = "ghcr.io/x/y@sha256:' + "a" * 64 + '"\n'
