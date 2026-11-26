@@ -29,8 +29,9 @@ What has to be correct for the above to hold:
 - the host kernel (namespaces, seccomp, cgroups, SELinux or AppArmor enforcement);
 - Podman, crun and conmon, and the SELinux container policy or, on hosts without SELinux, silo's
   AppArmor profile (`host/apparmor/silo-runtime`);
-- silo's launcher, connector, exec supervisor and gateway: about 2,100 lines of Python (`sandbox.py`,
-  `seccomp.py`, `runtime.py`, `connector.py`, `execlock.py`, `gateway.py`), standard library only;
+- silo's launcher, connector, exec supervisor and gateway: about 2,500 lines of Python (`sandbox.py`,
+  `seccomp.py`, `runtime.py`, `connector.py`, `execlock.py`, `apparmor.py`, `gateway.py`), standard
+  library only;
 - the base seccomp profile shipped by the distribution, which silo tightens but does not replace;
 - with `runtime.runsc`: gVisor (`runsc`, its sentry and its gofer), which then stands where the host
   kernel's system call interface stood, and without SELinux around it;
