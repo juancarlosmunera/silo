@@ -10,9 +10,9 @@ symlinks and executables, and records size/mtime/sha256 per file. The manifest l
 state directory, outside the model directory, so whatever can tamper with weights cannot also
 rewrite the record of what the weights should be.
 
-Scope: this is a format gate plus an integrity record, not a deep validator. A well-formed GGUF can
-still carry a malicious chat template or trigger a parser bug in the runtime; that is what the
-sandbox is for.
+GGUF headers are parsed in full and checked structurally (silo.gguf): counts, lengths, types and
+every tensor's extent against the file. A well-formed GGUF can still carry a malicious chat
+template or trigger a parser bug the check does not anticipate; that is what the sandbox is for.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from silo import gguf
 
 WEIGHT_FORMATS = {".gguf", ".safetensors"}
 AUX_FORMATS = {".json", ".txt", ".md", ".model", ".tiktoken", ".jinja", ".vocab", ".tokenizer"}
@@ -74,12 +76,14 @@ def classify(root: Path, path: Path) -> Verdict:
         if problem:
             return Verdict(rel, False, "magic", f"content is a {problem}")
         if ext == ".gguf":
-            if head[:4] != b"GGUF":
-                return Verdict(rel, False, "gguf", "missing GGUF magic")
-            version = struct.unpack("<I", head[4:8])[0]
-            if version not in (2, 3):
-                return Verdict(rel, False, "gguf", f"unsupported GGUF version {version}")
-            return Verdict(rel, True, "gguf", f"GGUF v{version}")
+            fh.seek(0)
+            try:
+                info = gguf.validate(fh, path.stat().st_size)
+            except gguf.UnknownTensorType as exc:
+                return Verdict(rel, False, "unknown", str(exc))
+            except gguf.GGUFError as exc:
+                return Verdict(rel, False, "gguf", str(exc))
+            return Verdict(rel, True, "gguf", info.summary())
         if ext == ".safetensors":
             if len(head) < 9:
                 return Verdict(rel, False, "safetensors", "truncated header")
