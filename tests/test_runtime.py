@@ -248,5 +248,19 @@ class RunDirTests(unittest.TestCase):
         self.assertFalse(any(line.startswith(("from silo", "import silo")) for line in script.splitlines()))  # runs from source under `podman unshare`, outside the package
 
 
+class EarlyExitTests(unittest.TestCase):
+    def test_a_runtime_that_died_is_reported_with_its_reason(self):
+        cfg = Config(name="t")
+        with mock.patch.object(runtime, "container_running", return_value=False), \
+                mock.patch.object(runtime, "_exit_hint", return_value="exit code 1"), \
+                mock.patch.object(runtime, "_tail_logs", return_value="error: invalid argument: --x"):
+            with self.assertRaises(runtime.LaunchError) as cm:
+                runtime._raise_if_exited(cfg)
+        self.assertIn("exited during startup (exit code 1)", str(cm.exception))
+        self.assertIn("invalid argument: --x", str(cm.exception))
+        with mock.patch.object(runtime, "container_running", return_value=True):
+            runtime._raise_if_exited(cfg)  # still running: nothing to report
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -371,19 +371,29 @@ def up(cfg: Config, verify: bool = True, full_verify: bool = False) -> None:
         if code != 0:
             raise LaunchError(f"podman run failed:\n{safe_text(err.strip())}")
         if not lock:
-            start_connector(cfg, container_pid(cfg.container_name))
+            try:
+                start_connector(cfg, container_pid(cfg.container_name))
+            except LaunchError:
+                _raise_if_exited(cfg)  # a runtime that died at once is the news, not the connector missing it
+                raise
         _wait_until_healthy(cfg, deadline, lock)
     except BaseException:
         down(cfg)  # fail closed: nothing half-started is left behind
         raise
 
 
+def _raise_if_exited(cfg: Config) -> None:
+    name = cfg.container_name
+    if not container_running(name):
+        raise LaunchError(f"{name} exited during startup ({_exit_hint(name, gvisor(cfg))}):\n"
+                          f"{_tail_logs(name)}") from None
+
+
 def _wait_until_healthy(cfg: Config, deadline: float, lock: GvisorSocketLock | None = None) -> None:
     name = cfg.container_name
     last = None
     while time.monotonic() < deadline:
-        if not container_running(name):
-            raise LaunchError(f"{name} exited during startup ({_exit_hint(name, gvisor(cfg))}):\n{_tail_logs(name)}")
+        _raise_if_exited(cfg)
         if lock and lock.error:
             raise lock.error
         if lock and not lock.locked.is_set():  # never talk to the socket before it is locked and checked

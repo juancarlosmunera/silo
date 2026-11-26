@@ -81,11 +81,11 @@ executable, find host sockets and credentials, and check the process's own privi
 | | stock rootless Podman | silo |
 |---|---|---|
 | contained (PASS) | 26 | 66 |
-| not contained (FAIL) | 31 | 0 |
+| not contained (FAIL) | 32 | 0 |
 | weaker than intended (WARN) | 7 | 0 |
 
-These are the numbers from the development machine. Two probes are skipped in the baseline because
-it has no model or socket mounts. Stock Podman is a good default for software you trust. It is not
+These are the numbers from the development machine. One probe is skipped in the baseline because
+it has no model directory mounted. Stock Podman is a good default for software you trust. It is not
 built for software you assume is trying to leave.
 
 With `seccomp_action = "kill"`, every denied syscall in the probe output reads
