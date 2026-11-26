@@ -120,14 +120,15 @@ jobs:
           sudo cat "/proc/$(podman container inspect --format '{{.State.Pid}}' silo-ci-kill)/attr/current"
           sudo cat "/proc/$(podman container inspect --format '{{.State.Pid}}' silo-ci-kill)/attr/current" | grep -q silo-runtime
 
-      # Everything the profile refused during this job. The probes' canary write is the only thing that
-      # should be here: anything else means the profile is in the way of the runtime or the probes.
+      # Everything the profile refused and logged during this job. The probes provoke a few refusals on
+      # purpose (a file under /proc, a look at the POSIX message queues); explicit deny rules, such as
+      # the canary's, are not logged. A refusal by anything but the probes means the profile is in the
+      # runtime's way.
       - name: What AppArmor denied
         if: always()
         run: |
           sudo dmesg 2>/dev/null | grep 'apparmor="DENIED"' | grep 'silo-runtime' > "$RUNNER_TEMP/denied.txt" || true
           sed -E 's/.*operation="([^"]*)".*name="([^"]*)".*comm="([^"]*)".*/\1 \2 (\3)/' "$RUNNER_TEMP/denied.txt" | sort | uniq -c
-          grep 'operation="getattr"' "$RUNNER_TEMP/denied.txt" | head -2 | sed -E 's/^.*apparmor=/apparmor=/' || true
           unexpected=$(grep -vc 'comm="python3"' "$RUNNER_TEMP/denied.txt" || true)
           echo "denials by anything but the probes: $unexpected"
           test "$unexpected" = 0

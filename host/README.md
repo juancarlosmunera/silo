@@ -112,8 +112,8 @@ the one the container runtime already had (Ubuntu's `crun` profile, which confin
 instead of replacing it, and every profile in such a stack has to allow an operation.
 
 Tested in CI on Ubuntu 24.04 (Podman 4.9, crun 1.14), x86_64 and aarch64: the probes in both
-seccomp modes and a model in a silo, with a check that the profile denied nothing but the probes'
-deliberate attempt. Not tested: GPU sandboxes under the profile, Debian, and SELinux hosts, where
+seccomp modes and a model in a silo, with a check that the profile refused nothing the runtime
+did. What it does refuse there are the probes' own attempts. Not tested: GPU sandboxes under the profile, Debian, and SELinux hosts, where
 silo does not use it.
 
 ## 4. Things only you can do
