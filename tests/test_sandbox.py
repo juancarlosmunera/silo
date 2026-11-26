@@ -41,7 +41,8 @@ class SandboxArgsTests(unittest.TestCase):
             with self.assertRaises(sandbox.HardeningError):
                 sandbox.gpu_devices("dri", dri)
         self.assertEqual(sandbox.gpu_devices("none"), ())
-        self.assertFalse(any("/card" in d for d in sandbox.gpu_devices("dri")) if sandbox.DRI_DIR.is_dir() else False)
+        if list(sandbox.DRI_DIR.glob("renderD*")):  # on a machine with a GPU: its real nodes, never a display node
+            self.assertFalse(any("/card" in d for d in sandbox.gpu_devices("dri")))
 
     def test_mounts(self):
         args = build(mounts=[sandbox.Mount(Path("/m"), "/models", shared_label=True),
