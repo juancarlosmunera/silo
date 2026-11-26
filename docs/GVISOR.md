@@ -47,8 +47,8 @@ was unpacked there into a directory owned by the user and readable by everyone.
 
 The probes and a small model also run on gVisor in CI for every change: Ubuntu 24.04, Podman 4.9,
 x86_64 and aarch64, on machines that are themselves virtual machines, with gVisor installed by
-root. Only the `systrap` platform is covered there; `kvm` has been tried on the Fedora machine
-alone.
+root. `systrap` runs on both architectures and `kvm` on x86_64 (GitHub's ARM machines have no KVM).
+Each job checks from the host which platform the sandbox is really on.
 
 ## 1. Install gVisor
 
@@ -178,10 +178,13 @@ tokens each:
 | gVisor, `kvm` | 43 |
 | gVisor, `systrap`, eight threads (what llama.cpp would pick by itself there) | 23 to 25 |
 
-`gvisor_platform = "kvm"` runs the workload in a hardware-virtualised guest. It needs a `/dev/kvm`
-that the sandbox's UID can open (on the Fedora test machine everyone can), and it hands that device
-to the sentry: faster, and one more kernel interface within reach of a compromised sentry. `systrap`
-needs nothing and also works where there is no KVM, such as most rented servers.
+`gvisor_platform = "kvm"` runs the workload in a hardware-virtualised guest. It hands `/dev/kvm` to
+the sentry: faster, and one more kernel interface within reach of a compromised sentry. The sentry
+runs as the sandbox's UID, which is in no group, so `/dev/kvm` has to be open to everyone. On Fedora
+it is. On Ubuntu and Debian it belongs to root and the `kvm` group: `silo doctor` reports that, and
+it takes a udev rule to change (CI's is in `.github/workflows/sandbox.yml`), which opens KVM to
+every local user as well. `systrap` needs nothing and also works where there is no KVM, such as
+most rented servers.
 
 ## Stopping takes two seconds
 
