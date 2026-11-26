@@ -22,6 +22,10 @@ libseccomp detail this module depends on: an unconditional rule for a syscall si
 argument-filtered rule for the same syscall, whatever the action or order. So a syscall that needs
 argument filtering must first be removed from the base profile entirely (REPLACED) and re-added with
 conditions that are disjoint and exhaustive.
+
+Portability rule this module keeps: no rule compares the same argument twice. gVisor, which also
+enforces this profile when it is the sandbox's kernel, keeps one comparison per argument and drops
+the rest without an error (see _complement).
 """
 
 from __future__ import annotations
@@ -204,33 +208,22 @@ def _arg(index: int, value: int, op: str, value_two: int = 0) -> dict:
 U32 = 0xFFFFFFFF
 
 
-def _gaps(index: int, values) -> list[list[dict]]:
+def _complement(index: int, values) -> list[list[dict]]:
     """Conditions that together match every 64-bit value of one argument except `values`.
 
-    One rule per gap between consecutive allowed values (two comparisons on the same argument), so
-    the allow rules (equality) and these deny rules are disjoint and, between them, exhaustive. A
-    value with stray upper bits never equals an allowed one and falls into the last gap: denied.
-    """
-    vals = sorted(set(values))
-    gaps = [[_arg(index, vals[0], "SCMP_CMP_LT")]] if vals[0] > 0 else []
-    for low, high in zip(vals, vals[1:]):
-        if high - low > 1:
-            gaps.append([_arg(index, low, "SCMP_CMP_GT"), _arg(index, high, "SCMP_CMP_LT")])
-    if vals[-1] < (1 << 64) - 1:
-        gaps.append([_arg(index, vals[-1], "SCMP_CMP_GT")])
-    return gaps
+    Each is a single comparison, so that a rule never compares the same argument twice. That matters
+    beyond style: libseccomp evaluates both comparisons of a range like `> a AND < b`, but gVisor's
+    conversion of an OCI profile keeps one comparison per argument and silently drops the other,
+    which turns such a deny rule into `< b` and kills calls that are on the allowlist. libseccomp 2.6
+    also refuses (EEXIST) several range rules behind a shared condition on another argument.
 
-
-def _blocks(index: int, values) -> list[list[dict]]:
-    """Like `_gaps`, with one comparison per rule, for rules that already compare another argument.
-
-    libseccomp 2.6 refuses (EEXIST) several two-comparison range rules behind a shared condition on
-    another argument, so there the complement is written as aligned bit-prefix blocks of the low 32
-    bits (masked equality, like CIDR blocks), plus one rule for any value with upper bits set.
+    So the complement is written as aligned bit-prefix blocks of the low 32 bits (masked equality,
+    like the CIDR blocks that cover every address but a few), plus one rule for any value with upper
+    bits set. Together with the equality rules for `values` they are disjoint and exhaustive.
     """
     vals = sorted(set(values))
     if any(v > U32 for v in vals):
-        raise ValueError("block allowlists cover 32-bit values")
+        raise ValueError("allowlists cover 32-bit values")
     if len(vals) == 1:
         return [[_arg(index, vals[0], "SCMP_CMP_NE")]]
     out = [[_arg(index, U32, "SCMP_CMP_GT")]]
@@ -251,11 +244,11 @@ def _blocks(index: int, values) -> list[list[dict]]:
 
 
 def _allowlist_rules(name: str, index: int, values, deny: dict, prefix: tuple = (), label: str = "") -> list[dict]:
+    """Allow rules for `values` of one argument, then deny rules for everything else."""
     allow = [{"names": [name], "action": "SCMP_ACT_ALLOW", "args": [*prefix, _arg(index, v, "SCMP_CMP_EQ")],
               "comment": f"silo: {name}{label} allowlist"} for v in sorted(values)]
-    complement = _blocks(index, values) if prefix else _gaps(index, values)
-    denied = [{"names": [name], **deny, "args": [*prefix, *gap], "comment": f"silo: {name}{label} not allowlisted"}
-              for gap in complement]
+    denied = [{"names": [name], **deny, "args": [*prefix, *condition],
+               "comment": f"silo: {name}{label} not allowlisted"} for condition in _complement(index, values)]
     return allow + denied
 
 
@@ -264,11 +257,13 @@ def argument_rules(action: str) -> list[dict]:
     deny = _deny(action, EPERM)
     rules = _allowlist_rules("ioctl", 1, IOCTL_ALLOW, deny)
     rules += _allowlist_rules("prctl", 0, PRCTL_ALLOW, deny)
-    rules += [{"names": ["setsockopt"], **deny, "args": gap, "comment": "silo: setsockopt level not allowlisted"}
-              for gap in _gaps(1, SETSOCKOPT_ALLOW)]
+    # Allow rules come before deny rules for each syscall. With disjoint rules the order means nothing,
+    # but an engine that evaluated them first-match would then at worst allow what is allowlisted.
     for level, names in SETSOCKOPT_ALLOW.items():
         rules += _allowlist_rules("setsockopt", 2, names, deny, prefix=(_arg(1, level, "SCMP_CMP_EQ"),),
                                   label=f" level {level}")
+    rules += [{"names": ["setsockopt"], **deny, "args": condition, "comment": "silo: setsockopt level not allowlisted"}
+              for condition in _complement(1, SETSOCKOPT_ALLOW)]
     return rules
 
 
