@@ -12,6 +12,9 @@ import json
 import sys
 
 MIN_PROBES = 60
+# Refused without SIGSYS by design: clone3 is ENOSYS in every mode so that libc falls back to clone(2),
+# and args.allowlisted checks a call that must succeed.
+NOT_KILLED = {"sys.clone3", "args.allowlisted"}
 
 
 def main() -> int:
@@ -36,7 +39,7 @@ def main() -> int:
             else:
                 problems.append(line)
         if (args.mode == "kill" and r["status"] == "PASS" and r["probe"].startswith(("sys.", "args."))
-                and r["probe"] != "args.allowlisted" and "SIGSYS" not in r["detail"]):
+                and r["probe"] not in NOT_KILLED and "SIGSYS" not in r["detail"]):
             problems.append(f"{line}  (kill mode: expected SIGSYS)")
     unused = set(allowed) - {r["probe"] for r in results if r["status"] in ("FAIL", "WARN")}
     for probe in sorted(unused):
