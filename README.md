@@ -28,7 +28,7 @@ the gateway exists to narrow and record it.
 **Contents:** [Isn't a container enough?](#isnt-a-container-enough) ·
 [How it works](#how-it-works) · [Check it yourself](#check-it-yourself) ·
 [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start) ·
-[On a VPS](#on-a-vps) · [In a local VM](#in-a-local-vm) · [Commands](#commands) ·
+[On a VPS](#on-a-vps) · [In a local VM](#in-a-local-vm) · [On gVisor](#on-gvisor) · [Commands](#commands) ·
 [Configuration](#configuration) ·
 [The gateway](#the-gateway) ·
 [Tightening it further](#tightening-it-further) · [Limits](#limits) · [Roadmap](#roadmap) ·
@@ -236,6 +236,25 @@ bin/silo-vm start       # from now on: no network device
 It needs KVM and costs the guest's memory. In a quick test, inference in the VM was as fast as on
 the host. [docs/LOCAL_VM.md](docs/LOCAL_VM.md) has the walkthrough, tested from a fresh VM.
 
+## On gVisor
+
+A second kernel without a virtual machine. With [gVisor](https://gvisor.dev) installed and
+
+```toml
+[runtime]
+runsc = "/usr/local/bin/runsc"
+```
+
+silo starts the same sandbox on gVisor's user-space kernel: the runtime's system calls are served
+by gVisor and no longer reach your kernel directly, and the process a break-out would land in is
+an unprivileged UID with no capabilities. silo's own controls, its seccomp profile included, still
+apply inside, and the escape probes pass there.
+
+It is a trade, not a free addition: SELinux does not confine a gVisor sandbox, one directory is
+shared with it for the runtime's socket, and inference was about 20% slower in a quick test (8% on
+gVisor's KVM platform). [docs/GVISOR.md](docs/GVISOR.md) has the installation, what silo asks of
+gVisor and why, and the measurements.
+
 ## Commands
 
 | Command | What it does |
@@ -269,6 +288,8 @@ The settings that matter most. Every option, with comments, is in
 | `runtime.memory` | `"8g"` | Hard memory cap, with no swap on top. It has to fit the model plus its context. |
 | `runtime.seccomp_action` | `"errno"` | `"errno"` makes denied syscalls fail. `"kill"` terminates the runtime on the first one. |
 | `runtime.image` | llama.cpp server | Pin it with the image ID printed by `silo images`. |
+| `runtime.runsc` | none | Path to gVisor's `runsc`: run the sandbox on gVisor's user-space kernel. See [docs/GVISOR.md](docs/GVISOR.md). |
+| `runtime.gvisor_platform` | `"systrap"` | With `runsc`: `"systrap"` works everywhere, `"kvm"` is faster and hands `/dev/kvm` to gVisor. |
 | `runtime.gpu` | `"none"` | GPU passthrough. Exposes a GPU driver to the sandbox and is not yet verified. |
 | `gateway.listen`, `gateway.port` | `127.0.0.1`, `8088` | A non-loopback address is refused unless `api_key_env` is set. |
 | `gateway.scanner` | `"monitor"` | `"off"`, `"monitor"` (log and alert) or `"enforce"` (withhold high-severity completions). |
@@ -315,7 +336,8 @@ The defaults favour getting a model running. Once yours runs cleanly:
 5. Set `gateway.api_key_env` if other users or untrusted processes share the machine.
 6. Put a second boundary around all of it: [a VM with no network device](#in-a-local-vm) on your
    own machine, or [a dedicated, sealed server](#on-a-vps). Everything above narrows the way to a
-   kernel exploit. This is the step that limits what one would reach.
+   kernel exploit. This is the step that limits what one would reach. [gVisor](#on-gvisor) is the
+   lighter option: it puts a second kernel in the way on the machine you already use.
 
 `silo doctor` lists whichever of these are still open.
 
@@ -326,7 +348,8 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 - **The kernel is shared.** A kernel vulnerability reachable through the roughly 320 syscalls still
   allowed is the main way out of the sandbox. silo shrinks that surface; it does not remove it.
   Put a second boundary around it: a VM with no network device on your own machine
-  ([docs/LOCAL_VM.md](docs/LOCAL_VM.md)), or a dedicated, sealed server ([docs/VPS.md](docs/VPS.md)).
+  ([docs/LOCAL_VM.md](docs/LOCAL_VM.md)), a dedicated, sealed server ([docs/VPS.md](docs/VPS.md)), or
+  gVisor's user-space kernel ([docs/GVISOR.md](docs/GVISOR.md)).
 - **The answer still reaches you.** A model with no network can ask you to run something. The
   tripwire catches obvious shapes and is a regex, not a boundary. Treat output as untrusted input.
 - **Your client is outside the silo.** If it renders HTML, fetches images or executes tool calls,
@@ -338,7 +361,6 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 
 ## Roadmap
 
-- A lighter second kernel boundary than a full VM: gVisor as the sandbox runtime.
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - An origin allowlist with proper CORS handling, for browser-based clients.
@@ -373,6 +395,7 @@ examples/               annotated configuration, systemd unit
 docs/THREAT_MODEL.md    assumptions, controls, residual risk
 docs/VPS.md             deploying on a rented server, step by step
 docs/LOCAL_VM.md        a second kernel on your own machine: silo inside a VM
+docs/GVISOR.md          a second kernel without a VM: silo on gVisor
 ```
 
 ## Security

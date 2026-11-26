@@ -29,6 +29,12 @@ import sys
 
 MACHINE = platform.machine()
 RESULTS = []
+# The launcher passes --gvisor for sandboxes on gVisor (runtime.runsc). There, cgroups, /dev and the TTY
+# layer are gVisor's own emulation and host LSMs do not apply; the probes report that instead of
+# treating it as the host's. The flag is only honoured if the kernel really is gVisor (kernel.gvisor).
+GVISOR_REQUESTED = "--gvisor" in sys.argv[1:]
+GVISOR = GVISOR_REQUESTED and "gvisor" in platform.release().lower()
+GVISOR_DEV = {"fuse", "net", "char"}  # emulated inside gVisor's kernel, not host devices
 
 SYSNR = {
     "x86_64": {
@@ -325,6 +331,12 @@ def probe_compat_abi():
     kind, value = in_child(int80)
     if kind == "error" and ("PermissionError" in value or "mmap" in value):
         return record("abi.i386_int80_socket", "PASS", f"cannot map executable memory ({value})")
+    if kind == "signal" and value == signal.SIGSEGV:
+        # The only instruction in that stub that can fault is `int 0x80` itself: there is no gate for
+        # the vector. That is a kernel without 32-bit emulation, or gVisor on its KVM platform. Either
+        # way the i386 syscall table cannot be reached at all.
+        return record("abi.i386_int80_socket", "PASS",
+                      "int 0x80 faults (SIGSEGV): this kernel has no i386 syscall entry point")
     judge_syscall("abi.i386_int80_socket", (kind, value), "i386 int 0x80 socket(AF_INET)")
 
 
@@ -355,7 +367,9 @@ def probe_readonly():
 
 
 # Kernel-provided filesystems that cannot be a host directory.
-PSEUDO_FILESYSTEMS = ("proc", "sysfs", "cgroup2", "devpts", "mqueue")
+PSEUDO_FILESYSTEMS = ("proc", "sysfs", "cgroup", "cgroup2", "devpts", "mqueue")
+# gVisor sandboxes only: where the one shared directory, for the runtime's socket, is mounted.
+SOCKET_DIR = "/run/silo"
 
 
 def shared_writable_dirs(mountinfo, isdir=os.path.isdir):
@@ -378,14 +392,38 @@ def shared_writable_dirs(mountinfo, isdir=os.path.isdir):
 def probe_socket_dir():
     # The runtime answers on an abstract UNIX socket inside its own network namespace; the gateway
     # reaches it through silo's connector. No host directory is mounted into the sandbox writable.
+    #
+    # gVisor sandboxes are the exception: abstract sockets stay inside gVisor's kernel, so one
+    # directory is shared for the runtime's socket. silo locks it once the socket is bound, and the
+    # probes get it in that locked state.
     try:
         with open("/proc/self/mountinfo") as fh:
             host_mounts = shared_writable_dirs(fh)
     except (OSError, IndexError, ValueError) as exc:
         return record("fs.no_shared_dir", "WARN", f"cannot read the mount table ({exc})")
+    socket_dir = GVISOR and SOCKET_DIR in host_mounts
+    if socket_dir:
+        host_mounts.remove(SOCKET_DIR)
     if host_mounts:
-        return record("fs.no_shared_dir", "FAIL", f"host directories mounted writable: {host_mounts}")
-    record("fs.no_shared_dir", "PASS", "no host directory is mounted writable (the runtime socket is abstract)")
+        record("fs.no_shared_dir", "FAIL", f"host directories mounted writable: {host_mounts}")
+    elif socket_dir:
+        record("fs.no_shared_dir", "PASS", "the socket directory is the only host directory mounted writable")
+    else:
+        record("fs.no_shared_dir", "PASS", "no host directory is mounted writable (the runtime socket is abstract)")
+    if not GVISOR:
+        return
+    if not socket_dir:
+        return record("fs.socket_dir_locked", "SKIP", f"{SOCKET_DIR} is not mounted")
+    err = try_write(f"{SOCKET_DIR}/silo-probe")
+    if err is None:
+        return record("fs.socket_dir_locked", "FAIL", "sandbox can create files in the shared socket directory")
+    try:
+        os.symlink(f"{SOCKET_DIR}/elsewhere", f"{SOCKET_DIR}/llama.sock")
+        os.unlink(f"{SOCKET_DIR}/llama.sock")
+        return record("fs.socket_dir_locked", "FAIL", "sandbox can plant a symlink at the socket path")
+    except OSError:
+        pass
+    record("fs.socket_dir_locked", "PASS", f"shared socket directory is not writable ({err.strerror})")
 
 
 def writable_dirs():
@@ -467,13 +505,18 @@ EXPECTED_RW_MOUNTS = {"/tmp", "/dev", "/dev/shm", "/dev/pts", "/dev/mqueue", "/p
                       "/dev/console"}
 
 
+def _gvisor_expected(mountpoint):
+    """On gVisor: its emulated cgroup controllers under /sys/fs/cgroup, and the socket directory."""
+    return GVISOR and (mountpoint.startswith("/sys/fs/cgroup/") or mountpoint == SOCKET_DIR)
+
+
 def probe_mounts():
     rw = []
     with open("/proc/self/mountinfo") as fh:
         for line in fh:
             parts = line.split()
             mountpoint, opts = parts[4], parts[5].split(",")
-            if "rw" in opts and mountpoint not in EXPECTED_RW_MOUNTS:
+            if "rw" in opts and mountpoint not in EXPECTED_RW_MOUNTS and not _gvisor_expected(mountpoint):
                 rw.append(mountpoint)
     if rw:
         return record("fs.unexpected_rw_mounts", "WARN", f"writable mounts: {rw}")
@@ -541,8 +584,19 @@ def probe_pid_namespace():
     record("proc.pid_namespace", "PASS", f"{len(pids)} processes visible")
 
 
+def probe_gvisor():
+    if not GVISOR_REQUESTED:
+        return
+    if GVISOR:
+        return record("kernel.gvisor", "PASS", f"running on gVisor's user-space kernel ({platform.release()})")
+    record("kernel.gvisor", "FAIL", f"the launcher asked for gVisor but the kernel is {platform.release()}")
+
+
 def probe_lsm():
     """Is the process confined by a mandatory access control policy (SELinux or AppArmor)?"""
+    if GVISOR:
+        return record("proc.lsm", "INFO", "not applicable: the sandbox runs on gVisor's kernel, which host "
+                                          "SELinux/AppArmor policies do not reach (see kernel.gvisor)")
     try:
         with open("/proc/self/attr/current") as fh:
             label = fh.read().strip("\0\n ")
@@ -575,6 +629,9 @@ def probe_environment():
 
 
 def probe_cgroup_limits():
+    if GVISOR:
+        return record("proc.cgroup_limits", "INFO", "enforced on the host by silo's systemd scope around the "
+                                                    "gVisor sandbox (not visible inside it)")
     limits = {}
     for name in ("memory.max", "pids.max"):
         try:
@@ -600,7 +657,7 @@ def probe_devices():
         entries = set(os.listdir("/dev"))
     except OSError as exc:
         return record("dev.nodes", "WARN", f"/dev unreadable ({exc.strerror})")
-    extra = sorted(entries - STANDARD_DEV)
+    extra = sorted(entries - STANDARD_DEV - (GVISOR_DEV if GVISOR else set()))
     critical = sorted(e for e in extra if e in CRITICAL_DEV)
     if critical:
         return record("dev.nodes", "FAIL", f"host-facing devices present: {critical}")
@@ -611,6 +668,8 @@ def probe_devices():
 
 def probe_pty():
     # No pty means no TTY layer: no line-discipline autoload (n_gsm & co), no TIOCSTI.
+    if GVISOR:
+        return record("dev.pty", "PASS", "pseudo-terminals, if any, are gVisor's own; the host TTY layer is not reachable")
     for path in ("/dev/ptmx", "/dev/pts/ptmx"):
         try:
             fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
@@ -655,7 +714,7 @@ def probe_kernel_leaks():
 
 def main():
     record("meta.host", "INFO", f"arch={MACHINE} kernel={platform.release()} python={platform.python_version()}")
-    for fn in (probe_interfaces, probe_routes, probe_socket_families, probe_socketpair, probe_dns,
+    for fn in (probe_gvisor, probe_interfaces, probe_routes, probe_socket_families, probe_socketpair, probe_dns,
                probe_tcp_egress, probe_abstract_unix, probe_syscalls, probe_clone_newuser, probe_compat_abi,
                probe_readonly, probe_socket_dir, probe_tmp_noexec, probe_memfd_exec, probe_mounts,
                probe_host_artifacts, probe_credentials, probe_pid_namespace, probe_lsm, probe_environment,

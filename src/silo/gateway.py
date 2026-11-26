@@ -74,14 +74,34 @@ class ClientGone(Exception):
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
-    """HTTP to the runtime over a socket handed over by the connector at `control`."""
+    """HTTP to the runtime over a socket obtained from `dial(timeout)` (see `runtime_dialer`)."""
 
-    def __init__(self, control: str, timeout: float, expect_uid: int | None = None):
+    def __init__(self, dial, timeout: float):
         super().__init__("localhost", timeout=timeout)
-        self._control, self._expect_uid = control, expect_uid
+        self._dial = dial
 
     def connect(self) -> None:
-        self.sock = connector.dial(self._control, self.timeout, self._expect_uid)
+        self.sock = self._dial(self.timeout)
+
+
+def runtime_path(cfg: Config) -> Path:
+    """The host-side socket the gateway dials: the connector's, or on gVisor the runtime's own."""
+    return cfg.gvisor_socket_path if cfg.runtime.runsc is not None else cfg.control_path
+
+
+def runtime_dialer(cfg: Config, path: Path | None = None, expect_uid: int | None | bool = True):
+    """How to reach this silo's runtime.
+
+    Normally through the connector, checking that the peer is the sandbox's UID. On gVisor the
+    runtime's socket is created on the host by gVisor's gofer, in a directory silo locks, and the
+    listening peer is that gofer, which runs as this user.
+    """
+    target = str(path or runtime_path(cfg))
+    if cfg.runtime.runsc is not None:
+        uid = os.getuid() if expect_uid is True else expect_uid
+        return lambda timeout: connector.dial_socket(target, timeout, uid)
+    uid = sandbox_uid() if expect_uid is True else expect_uid
+    return lambda timeout: connector.dial(target, timeout, uid)
 
 
 class AuditLog:
@@ -141,9 +161,9 @@ class Gateway:
                  expect_uid: int | None | bool = True):
         self.cfg = cfg
         self.gw = cfg.gateway
-        self.control_path = str(control_path or cfg.control_path)
-        # The sandbox's host UID, checked on every connection the connector hands over.
-        self.expect_uid = sandbox_uid() if expect_uid is True else expect_uid
+        self.control_path = str(control_path or runtime_path(cfg))
+        self.via = "gVisor" if cfg.runtime.runsc is not None else "connector"
+        self.dial = runtime_dialer(cfg, control_path, expect_uid)
         self.audit = audit or AuditLog(cfg.audit_log)
         self.slots = threading.BoundedSemaphore(self.gw.max_concurrency)
         self.loopback_only = ipaddress.ip_address(self.gw.listen).is_loopback
@@ -347,7 +367,7 @@ def _make_handler(gw: Gateway):
 
         def _proxy(self, method: str, path: str, body: bytes, stream: bool, entry: dict) -> None:
             deadline = self._t0 + cfg.timeout
-            conn = UnixHTTPConnection(gw.control_path, timeout=cfg.timeout, expect_uid=gw.expect_uid)
+            conn = UnixHTTPConnection(gw.dial, timeout=cfg.timeout)
             try:
                 headers = {"Accept": JSON_TYPE}
                 if method == "POST":
@@ -490,7 +510,7 @@ def serve(cfg: Config) -> None:
     srv = gw.server()
     host, port = srv.server_address[:2]
     shown = f"[{host}]" if ":" in host else host
-    print(f"silo[{cfg.name}] gateway on http://{shown}:{port}/v1  ->  {gw.control_path} (connector)", file=sys.stderr)
+    print(f"silo[{cfg.name}] gateway on http://{shown}:{port}/v1  ->  {gw.control_path} ({gw.via})", file=sys.stderr)
     print(f"silo[{cfg.name}] scanner={cfg.gateway.scanner} tools={'allowed' if cfg.gateway.allow_tools else 'refused'}"
           f" audit={gw.audit.path}", file=sys.stderr, flush=True)
     try:

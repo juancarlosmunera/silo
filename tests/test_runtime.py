@@ -64,6 +64,130 @@ class ServerCommandTests(unittest.TestCase):
         compile(script, "escape_probes.py", "exec")
 
 
+def gvisor_cfg(**model):
+    cfg = cfg_with()
+    cfg.runtime.runsc = Path("/usr/local/bin/runsc")
+    for key, value in model.items():
+        setattr(cfg.model, key, value)
+    return cfg
+
+
+class GvisorCommandTests(unittest.TestCase):
+    def test_runtime_listens_in_the_mounted_directory(self):
+        with mock.patch.object(runtime, "physical_cores", return_value=None):
+            cmd = runtime.server_command(gvisor_cfg())
+        self.assertEqual(cmd[2:4], ["--host", "/run/silo/llama.sock"])
+        self.assertNotIn("--threads", cmd)
+        self.assertEqual(runtime.server_command(cfg_with())[2:4], ["--host", "@" + runtime.ABSTRACT_SOCKET])
+
+    def test_threads_default_to_physical_cores_on_gvisor_only(self):
+        with mock.patch.object(runtime, "physical_cores", return_value=6):
+            cmd = runtime.server_command(gvisor_cfg())
+            self.assertEqual(cmd[cmd.index("--threads") + 1], "6")
+            cmd = runtime.server_command(gvisor_cfg(threads=2))  # an explicit setting wins
+            self.assertEqual(cmd[cmd.index("--threads") + 1], "2")
+            self.assertNotIn("--threads", runtime.server_command(cfg_with()))  # llama.cpp decides on the host kernel
+
+    def test_physical_cores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sysfs = Path(tmp)
+            layout = {0: ("0", "0"), 1: ("0", "1"), 2: ("0", "0"), 3: ("0", "1"), 4: ("1", "0"), 5: ("1", "0")}
+            for cpu, (package, core) in layout.items():
+                topology = sysfs / f"cpu{cpu}" / "topology"
+                topology.mkdir(parents=True)
+                (topology / "physical_package_id").write_text(package + "\n")
+                (topology / "core_id").write_text(core + "\n")
+            with mock.patch.object(os, "sched_getaffinity", return_value={0, 1, 2, 3, 4, 5}):
+                self.assertEqual(runtime.physical_cores(sysfs), 3)   # two hyperthreaded cores and one more package
+            with mock.patch.object(os, "sched_getaffinity", return_value={0, 2}):
+                self.assertEqual(runtime.physical_cores(sysfs), 1)   # only what this process may run on
+            with mock.patch.object(os, "sched_getaffinity", return_value={0, 9}):
+                self.assertIsNone(runtime.physical_cores(sysfs))     # topology not readable: do not guess
+
+    def test_scope_carries_the_limits(self):
+        cfg = gvisor_cfg()
+        cfg.runtime.memory, cfg.runtime.pids_limit, cfg.runtime.cpus = "3g", 100, 1.5
+        with mock.patch.object(runtime.shutil, "which", return_value="/usr/bin/systemd-run"):
+            args = runtime.scoped(cfg, ["podman", "run"])
+            self.assertEqual(args[:3], ["systemd-run", "--user", "--scope"])
+            self.assertEqual(args[-2:], ["podman", "run"])
+            for prop in (f"MemoryMax={3 << 30}", "MemorySwapMax=0", "TasksMax=712", "CPUQuota=150%"):
+                self.assertIn(prop, args)
+            self.assertIn(f"MemoryMax={512 << 20}", runtime.scoped(cfg, ["podman"], memory="512m"))
+        self.assertEqual(runtime.scoped(cfg_with(), ["podman", "run"]), ["podman", "run"])  # host kernel: no scope
+
+    def test_no_scope_means_no_launch(self):
+        with mock.patch.object(runtime.shutil, "which", return_value=None), self.assertRaises(runtime.LaunchError):
+            runtime.scoped(gvisor_cfg(), ["podman", "run"])
+
+
+class GvisorSocketDirTests(unittest.TestCase):
+    """On gVisor one directory is shared for the runtime's socket; it is locked once the socket exists."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = gvisor_cfg()
+        runtime.prepare_run_dir(self.cfg)
+        self.cfg.gvisor_socket_dir.mkdir(mode=0o700)
+        os.chmod(self.cfg.gvisor_socket_dir, 0o777)
+
+    def bind(self, name="llama.sock"):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.cfg.gvisor_socket_dir / name))
+        self.addCleanup(listener.close)
+
+    def lock(self):
+        lock = runtime.GvisorSocketLock(self.cfg, time.monotonic() + 5)
+        lock.start()
+        return lock
+
+    def test_locks_as_soon_as_the_socket_appears(self):
+        lock = self.lock()
+        time.sleep(0.05)
+        self.assertFalse(lock.locked.is_set())
+        self.assertFalse(runtime.runtime_reachable(self.cfg))  # an open directory is not a usable one
+        self.bind()
+        self.assertTrue(lock.locked.wait(2))
+        self.assertIsNone(lock.error)
+        self.assertEqual(oct(os.stat(self.cfg.gvisor_socket_dir).st_mode & 0o777), "0o755")
+        self.assertTrue(runtime.runtime_reachable(self.cfg))
+
+    def test_anything_but_the_socket_fails_the_launch(self):
+        for plant in ("file", "symlink", "extra"):
+            with self.subTest(plant=plant):
+                directory = self.cfg.gvisor_socket_dir
+                os.chmod(directory, 0o777)
+                for entry in directory.iterdir():
+                    entry.unlink()
+                lock = self.lock()
+                if plant == "file":
+                    (directory / "llama.sock").write_text("not a socket")
+                elif plant == "symlink":
+                    os.symlink("/run/user/1000/bus", directory / "llama.sock")
+                else:
+                    (directory / "dropped").write_text("x")
+                self.assertTrue(lock.locked.wait(2))
+                self.assertIsInstance(lock.error, runtime.LaunchError)
+                self.assertIn("unexpected content", str(lock.error))
+                self.assertFalse(runtime.runtime_reachable(self.cfg))
+
+    def test_gives_up_at_the_deadline(self):
+        lock = runtime.GvisorSocketLock(self.cfg, time.monotonic() + 0.05)
+        lock.start()
+        lock.join(2)
+        self.assertFalse(lock.is_alive())
+        self.assertFalse(lock.locked.is_set())
+
+    def test_health_goes_through_the_locked_socket_only(self):
+        self.assertIsNone(runtime.health(self.cfg))            # nothing bound
+        self.bind()
+        self.assertIsNone(runtime.health(self.cfg, timeout=1))  # bound, but the directory is still open
+
+
 class RunDirTests(unittest.TestCase):
     """The host-side directory for the connector's control socket, never shared with a sandbox."""
 
@@ -110,10 +234,10 @@ class RunDirTests(unittest.TestCase):
     def test_connector_state(self):
         runtime.prepare_run_dir(self.cfg)
         self.assertIsNone(runtime.connector_pid(self.cfg))
-        self.assertFalse(runtime.connector_serving(self.cfg))
+        self.assertFalse(runtime.runtime_reachable(self.cfg))
         self.cfg.connector_pidfile.write_text(f"{os.getpid()}\n")
         self.assertEqual(runtime.connector_pid(self.cfg), os.getpid())
-        self.assertFalse(runtime.connector_serving(self.cfg))  # no control socket yet
+        self.assertFalse(runtime.runtime_reachable(self.cfg))  # no control socket yet
         for junk in ("", "abc", "1", "-5"):
             self.cfg.connector_pidfile.write_text(junk)
             self.assertIsNone(runtime.connector_pid(self.cfg))

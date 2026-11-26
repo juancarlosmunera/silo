@@ -73,6 +73,54 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(s.recv(16), b"")  # closed without an answer
         connector.dial(self.control, 5).close()  # and it keeps serving
 
+    def host_socket(self, mode=0o755):
+        """A listening socket in a directory, as gVisor leaves one on the host for the runtime."""
+        directory = Path(self.tmp.name) / "sock"
+        directory.mkdir()
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(directory / "llama.sock"))
+        srv.listen(4)
+        self.addCleanup(srv.close)
+        directory.chmod(mode)
+        return directory / "llama.sock", srv
+
+    def test_dial_socket(self):
+        path, srv = self.host_socket()
+        sock = connector.dial_socket(str(path), 5, expect_uid=os.getuid())
+        peer, _ = srv.accept()
+        sock.sendall(b"ping")
+        self.assertEqual(peer.recv(4), b"ping")
+        peer.close()
+        sock.close()
+        with self.assertRaises(connector.DialError) as cm:
+            connector.dial_socket(str(path), 5, expect_uid=os.getuid() + 1)
+        self.assertIn("peer UID", str(cm.exception))
+
+    def test_dial_socket_needs_a_locked_directory(self):
+        for mode in (0o777, 0o775, 0o757):  # still writable by somebody else: not locked
+            with self.subTest(mode=oct(mode)):
+                path, _ = self.host_socket(mode)
+                with self.assertRaises(connector.DialError) as cm:
+                    connector.dial_socket(str(path), 5)
+                self.assertIn("locked directory", str(cm.exception))
+                path.unlink()
+                path.parent.rmdir()
+
+    def test_dial_socket_refuses_what_is_not_the_socket_itself(self):
+        path, _ = self.host_socket()
+        link = path.parent / "link.sock"
+        link.symlink_to(path)
+        with self.assertRaises(connector.DialError):  # a symlink, even to a real socket
+            connector.dial_socket(str(link), 5)
+        plain = path.parent / "plain"
+        plain.write_text("x")
+        with self.assertRaises(connector.DialError):
+            connector.dial_socket(str(plain), 5)
+        with self.assertRaises(FileNotFoundError):
+            connector.dial_socket(str(path.parent / "missing.sock"), 5)
+        with self.assertRaises(FileNotFoundError):
+            connector.dial_socket(str(Path(self.tmp.name) / "nodir" / "llama.sock"), 5)
+
     def test_refuses_its_own_network_namespace(self):
         with self.assertRaises(RuntimeError):
             connector._join_netns(os.getpid())

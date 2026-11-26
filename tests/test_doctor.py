@@ -129,9 +129,24 @@ class KernelIsolationTests(unittest.TestCase):
             self.assertNotIn("roadmap", check.detail + check.fix)
 
     def test_installed_but_unused_runtimes_are_named(self):
-        check = doctor.kernel_isolation_check(None, None, ["runsc"])
-        self.assertIn("runsc is installed; silo does not use it yet", check.detail)
+        check = doctor.kernel_isolation_check(None, None, ["krun"])
+        self.assertIn("krun is installed; silo does not use it yet", check.detail)
         self.assertNotIn("installed", doctor.kernel_isolation_check(None, None, []).detail)
+
+    def test_gvisor_is_offered_as_a_boundary(self):
+        plain = doctor.kernel_isolation_check(None, None, [])
+        self.assertIn("docs/GVISOR.md", plain.fix)
+        found = doctor.kernel_isolation_check(None, None, [], runsc_on_path="/usr/local/bin/runsc")
+        self.assertEqual(found.level, doctor.WARN)  # installed is not configured
+        self.assertIn('runtime.runsc = "/usr/local/bin/runsc"', found.fix)
+        self.assertIn("docs/LOCAL_VM.md", found.fix)
+
+    def test_gvisor_in_use_is_a_second_kernel(self):
+        for virt, sealed in ((None, None), ("kvm, QEMU", None), ("kvm, QEMU", False)):
+            check = doctor.kernel_isolation_check(virt, sealed, [], gvisor="release-20261123.1")
+            self.assertEqual((check.level, check.fix), (doctor.OK, ""))
+            self.assertIn("gVisor release-20261123.1", check.detail)
+        self.assertIn("kvm, QEMU", doctor.kernel_isolation_check("kvm, QEMU", None, [], gvisor="x").detail)
 
     def test_virtual_machine_counts_only_once_it_is_shown_to_be_sealed(self):
         untested = doctor.kernel_isolation_check("kvm, QEMU", None, [])
@@ -151,19 +166,64 @@ class RunChecksTests(unittest.TestCase):
     PODMAN = {"host": {"security": {"rootless": True, "selinuxEnabled": True}, "ociRuntime": {"name": "crun"},
                        "cgroupVersion": "v2", "cgroupControllers": ["cpu", "memory", "pids"]}}
 
-    def run_checks(self, virt, sealed, systemctl_missing=False):
+    def run_checks(self, virt, sealed, systemctl_missing=False, cfg=None, tools=("podman",), runsc_version=None,
+                   podman=None):
         def fake_run(cmd, *args, **kwargs):
             if cmd[0] == "systemctl" and systemctl_missing:
                 raise FileNotFoundError("systemctl")
             return subprocess.CompletedProcess(cmd, 0, stdout="inactive\n", stderr="")
 
         from silo.config import Config
-        with mock.patch.object(doctor.shutil, "which", side_effect=lambda name: "/usr/bin/podman" if name == "podman" else None), \
-                mock.patch.object(doctor, "_podman_info", return_value=self.PODMAN), \
+        with mock.patch.object(doctor.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}" if name in tools else None), \
+                mock.patch.object(doctor, "_podman_info", return_value=podman or self.PODMAN), \
                 mock.patch.object(doctor, "_virtualization", return_value=virt), \
                 mock.patch.object(doctor, "_linger", return_value=None), \
+                mock.patch.object(doctor, "_runsc_version", return_value=runsc_version), \
                 mock.patch.object(doctor.subprocess, "run", side_effect=fake_run):
-            return {c.name: c for c in doctor.run_checks(Config(), sealed=sealed)}
+            return {c.name: c for c in doctor.run_checks(cfg or Config(), sealed=sealed)}
+
+    def gvisor_cfg(self, platform="systrap"):
+        from pathlib import Path
+
+        from silo.config import Config
+        cfg = Config()
+        cfg.runtime.runsc = Path("/usr/local/bin/runsc")
+        cfg.runtime.gvisor_platform = platform
+        return cfg
+
+    def test_gvisor_sandbox(self):
+        checks = self.run_checks(None, None, cfg=self.gvisor_cfg(), tools=("podman", "systemd-run"),
+                                 runsc_version="release-20261123.1")
+        self.assertEqual(checks["kernel isolation"].level, doctor.OK)
+        self.assertEqual(checks["gVisor"].level, doctor.OK)
+        self.assertIn("directfs off", checks["gVisor"].detail)
+        self.assertEqual(checks["gVisor resource limits"].level, doctor.OK)
+        self.assertNotIn("gVisor platform", checks)
+        # SELinux is enforcing on the host and says so, but it is not what confines this sandbox
+        with mock.patch.object(doctor.Path, "exists", return_value=True), \
+                mock.patch.object(doctor.Path, "read_text", return_value="1"):
+            checks = self.run_checks(None, None, cfg=self.gvisor_cfg(), tools=("podman", "systemd-run"),
+                                     runsc_version="release-20261123.1")
+        self.assertEqual(checks["SELinux"].level, doctor.WARN)
+        self.assertIn("does not confine a gVisor sandbox", checks["SELinux"].detail)
+
+    def test_gvisor_that_cannot_be_limited_or_run_is_bad(self):
+        checks = self.run_checks(None, None, cfg=self.gvisor_cfg(), runsc_version="release-20261123.1")
+        self.assertEqual(checks["gVisor resource limits"].level, doctor.BAD)  # no systemd-run
+        checks = self.run_checks(None, None, cfg=self.gvisor_cfg(), tools=("podman", "systemd-run"))
+        self.assertEqual(checks["gVisor"].level, doctor.BAD)                  # runsc --version failed
+        self.assertEqual(checks["kernel isolation"].level, doctor.WARN)       # so no second kernel is claimed
+
+    def test_gvisor_without_any_lsm_is_a_warning_not_a_failure(self):
+        podman = {"host": {**self.PODMAN["host"], "security": {"rootless": True}}}
+        with_gvisor = self.run_checks(None, None, cfg=self.gvisor_cfg(), tools=("podman", "systemd-run"),
+                                      runsc_version="release-1", podman=podman)
+        self.assertEqual(with_gvisor["LSM"].level, doctor.WARN)
+        self.assertEqual(self.run_checks(None, None, podman=podman)["LSM"].level, doctor.BAD)
+
+    def test_installed_runsc_is_pointed_out_when_not_configured(self):
+        checks = self.run_checks(None, None, tools=("podman", "runsc"))
+        self.assertIn('runtime.runsc = "/usr/bin/runsc"', checks["kernel isolation"].fix)
 
     def test_sealed_result_reaches_the_kernel_isolation_finding(self):
         self.assertEqual(self.run_checks("kvm, QEMU", True)["kernel isolation"].level, doctor.OK)

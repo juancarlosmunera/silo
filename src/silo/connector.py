@@ -67,15 +67,47 @@ def dial(control: str, timeout: float, expect_uid: int | None = None) -> socket.
     try:
         if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
             raise DialError("connector handed over something that is not a UNIX stream socket")
-        if expect_uid is not None:
-            _pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-            if uid != expect_uid:
-                raise DialError(f"peer UID {uid} is not the sandbox's ({expect_uid})")
+        _check_peer(sock, expect_uid)
         sock.settimeout(timeout)
         return sock
     except BaseException:
         sock.close()
         raise
+
+
+def dial_socket(path: str, timeout: float, expect_uid: int | None = None) -> socket.socket:
+    """Connect to a runtime socket that exists on the host (gVisor sandboxes, see silo.runtime).
+
+    The socket sits in a directory silo locked once the runtime had bound it: owned by this user and
+    writable by nobody else. That, and the path itself being a socket, is checked with lstat on
+    every connection, so it can never be a symlink to some other host socket.
+    """
+    parent = os.path.dirname(path)
+    try:
+        directory, st = os.lstat(parent), os.lstat(path)
+    except OSError as exc:
+        raise FileNotFoundError(path) from exc
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+        raise DialError(f"{parent} is not a locked directory owned by this user")
+    if not stat.S_ISSOCK(st.st_mode):
+        raise DialError(f"{path} is not a socket")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(path)
+        _check_peer(sock, expect_uid)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+def _check_peer(sock: socket.socket, expect_uid: int | None) -> None:
+    if expect_uid is None:
+        return
+    _pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    if uid != expect_uid:
+        raise DialError(f"peer UID {uid} is not the sandbox's ({expect_uid})")
 
 
 # ----------------------------------------------------------------------------------------- server

@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +71,60 @@ class ConfigTests(unittest.TestCase):
         for text in bad:
             with self.subTest(text=text), self.assertRaises(config.ConfigError):
                 config.load(write(text))
+
+    def runsc(self, mode=0o755, dir_mode=0o755):
+        """A stand-in runsc in a directory other users can traverse (as /usr/local/bin is)."""
+        tmp = tempfile.mkdtemp(dir="/var/tmp")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = Path(tmp) / "runsc"
+        path.write_text("#!/bin/sh\n")
+        path.chmod(mode)
+        os.chmod(tmp, dir_mode)
+        return path
+
+    def test_gvisor(self):
+        path = self.runsc()
+        cfg = config.load(write(f'[runtime]\nrunsc = "{path}"\n'))
+        self.assertEqual((cfg.runtime.runsc, cfg.runtime.gvisor_platform), (path, "systrap"))
+        self.assertEqual(cfg.gvisor_socket_path, cfg.socket_dir / "sock" / "llama.sock")
+        cfg = config.load(write(f'[runtime]\nrunsc = "{path}"\ngvisor_platform = "kvm"\n'))
+        self.assertEqual(cfg.runtime.gvisor_platform, "kvm")
+        self.assertIsNone(config.Config().runtime.runsc)  # off unless asked for
+
+    def test_gvisor_refused(self):
+        good = self.runsc()
+        bad = {
+            "missing": '[runtime]\nrunsc = "/nonexistent/runsc"\n',
+            "not executable": f'[runtime]\nrunsc = "{self.runsc(mode=0o644)}"\n',
+            "replaceable by others": f'[runtime]\nrunsc = "{self.runsc(mode=0o777)}"\n',
+            "in a directory others can write to": f'[runtime]\nrunsc = "{self.runsc(dir_mode=0o777)}"\n',
+            "not reachable by the sandbox UID (file)": f'[runtime]\nrunsc = "{self.runsc(mode=0o750)}"\n',
+            "not reachable by the sandbox UID (directory)": f'[runtime]\nrunsc = "{self.runsc(dir_mode=0o700)}"\n',
+            "with a GPU": f'[runtime]\nrunsc = "{good}"\ngpu = "dri"\n',
+            "unknown platform": f'[runtime]\nrunsc = "{good}"\ngvisor_platform = "ptrace"\n',
+            "platform without runsc": '[runtime]\ngvisor_platform = "kvm"\n',
+            "wrong type": '[runtime]\nrunsc = true\n',
+        }
+        for label, text in bad.items():
+            with self.subTest(label), self.assertRaises(config.ConfigError):
+                config.load(write(text))
+
+    def test_private_home_install_is_explained(self):
+        with tempfile.TemporaryDirectory() as private:  # 0700, like ~/.local
+            path = Path(private) / "runsc"
+            path.write_text("#!/bin/sh\n")
+            path.chmod(0o755)
+            with self.assertRaises(config.ConfigError) as cm:
+                config.load(write(f'[runtime]\nrunsc = "{path}"\n'))
+        self.assertIn("unprivileged UID", str(cm.exception))
+        self.assertIn("/usr/local/bin", str(cm.exception))
+
+    def test_memory_bytes(self):
+        for text, expected in (("8g", 8 << 30), ("512m", 512 << 20), ("100k", 100 << 10), ("4096", 4096),
+                               ("4096b", 4096), ("2G", 2 << 30)):
+            self.assertEqual(config.memory_bytes(text), expected)
+        with self.assertRaises(config.ConfigError):
+            config.memory_bytes("lots")
 
     def test_safe_defaults(self):
         cfg = config.Config()

@@ -36,6 +36,13 @@ seccomp_action = "errno"
 gpu = "none"
 # seccomp_base = "/usr/share/containers/seccomp.json"
 startup_timeout = 600.0
+# gVisor: run the sandbox on a user-space kernel, so that the runtime's system calls no longer reach
+# this machine's kernel directly. The trade: SELinux does not confine a gVisor sandbox, one directory
+# is shared with it for the runtime's socket, and inference is somewhat slower. runsc must be installed
+# outside your home directory. See docs/GVISOR.md.
+# runsc = "/usr/local/bin/runsc"
+# "systrap" works everywhere. "kvm" is faster and hands /dev/kvm to gVisor.
+# gvisor_platform = "systrap"
 
 [gateway]
 listen = "127.0.0.1"

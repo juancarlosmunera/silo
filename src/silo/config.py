@@ -77,6 +77,8 @@ class RuntimeConfig:
     seccomp_action: str = "errno"  # errno | kill
     seccomp_base: Path = DEFAULT_SECCOMP_BASE
     startup_timeout: float = 600.0
+    runsc: Path | None = None  # gVisor's runsc binary: run the sandbox on gVisor's user-space kernel
+    gvisor_platform: str = "systrap"  # systrap | kvm
 
 
 @dataclass
@@ -112,6 +114,15 @@ class Config:
     @property
     def control_path(self) -> Path:
         return self.socket_dir / "control.sock"
+
+    @property
+    def gvisor_socket_dir(self) -> Path:
+        """gVisor sandboxes only: the one directory shared with the sandbox, for the runtime's socket."""
+        return self.socket_dir / "sock"
+
+    @property
+    def gvisor_socket_path(self) -> Path:
+        return self.gvisor_socket_dir / "llama.sock"
 
     @property
     def connector_pidfile(self) -> Path:
@@ -180,6 +191,36 @@ def _check_model_dir(path: Path) -> None:
         raise ConfigError("model.dir must not contain ':' or ',' (podman volume syntax)")
 
 
+def memory_bytes(value: str) -> int:
+    """A runtime.memory value (8g, 512m, 100k, 4096, 4096b) in bytes."""
+    if not _MEMORY_RE.match(value):
+        raise ConfigError("runtime.memory must look like 8g, 512m, ...")
+    digits = value.rstrip("bkmgBKMG")
+    return int(digits) * {"": 1, "b": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[value[len(digits):].lower()]
+
+
+def _check_runsc(path: Path) -> None:
+    """gVisor's runsc: executable, not replaceable by others, and reachable by another UID.
+
+    silo runs gVisor with directfs off, so its sentry runs as the sandbox's unprivileged subordinate
+    UID and has to be able to execute runsc and the helpers next to it. A copy under a private home
+    directory cannot be reached that way; gVisor's own installer puts it in /usr/local/bin.
+    """
+    if any(c in str(path) for c in ":,= "):
+        raise ConfigError("runtime.runsc must not contain ':', ',', '=' or spaces")
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ConfigError(f"runtime.runsc = {path} is not an executable file")
+    for item in (path, path.parent):
+        if item.stat().st_mode & 0o022:
+            raise ConfigError(f"runtime.runsc: {item} is writable by group or others; whoever can replace the "
+                              "runtime controls the sandbox")
+    blocked = [str(p) for p in (path, *path.parents) if not p.stat().st_mode & (0o005 if p == path else 0o001)]
+    if blocked:
+        raise ConfigError(f"runtime.runsc = {path} cannot be executed by the sandbox's unprivileged UID "
+                          f"(no access for others to {', '.join(blocked)}). Install gVisor outside your home "
+                          "directory, e.g. in /usr/local/bin (docs/GVISOR.md)")
+
+
 def validate(cfg: Config) -> Config:
     if not isinstance(cfg.name, str) or not _NAME_RE.match(cfg.name):
         raise ConfigError(f"invalid silo name {cfg.name!r}: use [a-z0-9_.-], max 63 chars")
@@ -201,6 +242,15 @@ def validate(cfg: Config) -> Config:
         raise ConfigError("timeouts must be > 0")
     if ":" in str(rt.seccomp_base):
         raise ConfigError("runtime.seccomp_base must not contain ':'")
+    if rt.gvisor_platform not in ("systrap", "kvm"):
+        raise ConfigError("runtime.gvisor_platform must be 'systrap' or 'kvm'")
+    if rt.runsc is None and rt.gvisor_platform != "systrap":
+        raise ConfigError("runtime.gvisor_platform is set but runtime.runsc is not")
+    if rt.runsc is not None:
+        _check_runsc(rt.runsc)
+        if rt.gpu != "none":
+            raise ConfigError("runtime.runsc cannot be combined with runtime.gpu: silo does not pass GPUs "
+                              "through gVisor")
     if gw.scanner not in ("off", "monitor", "enforce"):
         raise ConfigError("gateway.scanner must be off, monitor or enforce")
     if not 1 <= gw.port <= 65535:
