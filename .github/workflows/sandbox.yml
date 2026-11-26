@@ -117,40 +117,6 @@ jobs:
         if: always()
         run: bin/silo --config "$RUNNER_TEMP/silo-kill.toml" down || true
 
-  # Temporary: what does llama-server ask of ioctl, prctl and setsockopt on aarch64? The allowlists were
-  # measured on x86_64, and the runtime is killed by them at startup on ARM in kill mode.
-  trace-arm:
-    name: trace syscall arguments (aarch64)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
-    steps:
-      - name: Trace llama-server
-        run: |
-          command -v podman >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq podman; }
-          podman pull -q "$RUNTIME_IMAGE"
-          T="$RUNNER_TEMP/trace"; mkdir -p "$T/sock" "$T/out" "$T/model"; chmod 777 "$T/sock" "$T/out"
-          curl -sSfL -o "$T/model/model.gguf" "$MODEL_URL"
-          printf 'FROM %s\nRUN apt-get update -qq && apt-get install -y -qq strace >/dev/null\n' "$RUNTIME_IMAGE" > "$T/Containerfile"
-          podman build -q -t localhost/silo-trace "$T"
-          podman run -d --name tr --network=none --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-            -v "$T/model:/models:ro" -v "$T/sock:/run/silo" -v "$T/out:/out" --entrypoint strace localhost/silo-trace \
-            -f -qq -o /out/trace.txt -e trace=ioctl,prctl,setsockopt \
-            /app/llama-server --model /models/model.gguf --host /run/silo/llama.sock --ctx-size 1024 \
-            --offline --no-webui --no-webui-mcp-proxy --no-agent --no-slots
-          cd "$T/sock"
-          for _ in $(seq 1 90); do curl -sf --unix-socket llama.sock http://localhost/health >/dev/null && break; sleep 1; done
-          curl -sf --unix-socket llama.sock http://localhost/health; echo
-          curl -sf --unix-socket llama.sock http://localhost/v1/chat/completions -H 'Content-Type: application/json' \
-            -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}' | head -c 160; echo
-          curl -sfN --unix-socket llama.sock http://localhost/v1/chat/completions -H 'Content-Type: application/json' \
-            -d '{"messages":[{"role":"user","content":"count"}],"max_tokens":8,"stream":true}' | tail -n 2
-          for i in 1 2 3; do curl -sf --unix-socket llama.sock http://localhost/v1/chat/completions \
-            -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}' >/dev/null & done; wait
-          podman kill tr >/dev/null 2>&1 || true
-          echo "=== distinct ioctl / prctl / setsockopt calls on $(uname -m)"
-          sed -E 's/^[0-9]+ +//; s/0x[0-9a-f]{8,}/PTR/g; s/^(ioctl|setsockopt)\([0-9]+,/\1(FD,/' "$T/out/trace.txt" | sort | uniq -c | sort -rn | head -60
-          podman logs tr 2>&1 | grep -iE "system_info|sve|neon|threadpool" | head -5 || true
-
   gvisor:
     name: gVisor (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
@@ -173,7 +139,7 @@ jobs:
 
       # gVisor's own installation steps (docs/GVISOR.md): download, verify the checksum, unpack as root
       # where the sandbox's unprivileged UID can reach it and nobody but root can change it. On these
-      # runners /usr/local/bin is writable by others, which silo refuses, so it gets its own directory.
+      # runners /usr/local/bin and /opt are writable by everyone, which silo refuses, so it goes below /usr/lib.
       - name: gVisor
         run: |
           set -e
@@ -182,11 +148,11 @@ jobs:
           curl -fsSLO "$URL/gvisor.tar.zstd"
           curl -fsSLO "$URL/gvisor.tar.zstd.sha512"
           sha512sum -c gvisor.tar.zstd.sha512
-          sudo install -d -m 0755 -o root -g root /opt/gvisor
-          sudo tar --zstd -xf gvisor.tar.zstd -C /opt/gvisor
-          sudo chown -R root:root /opt/gvisor && sudo chmod -R go-w /opt/gvisor
-          ls -ld / /opt /opt/gvisor /opt/gvisor/runsc /opt/gvisor/gvisor-bin /usr/local/bin
-          /opt/gvisor/runsc --version
+          sudo install -d -m 0755 -o root -g root /usr/lib/gvisor
+          sudo tar --zstd -xf gvisor.tar.zstd -C /usr/lib/gvisor
+          sudo chown -R root:root /usr/lib/gvisor && sudo chmod -R go-w /usr/lib/gvisor
+          ls -ld / /usr /usr/lib /usr/lib/gvisor /usr/lib/gvisor/runsc /usr/lib/gvisor/gvisor-bin
+          /usr/lib/gvisor/runsc --version
 
       - name: Images
         run: |
@@ -208,7 +174,7 @@ jobs:
           [runtime]
           memory = "1g"
           seccomp_action = "$mode"
-          runsc = "/opt/gvisor/runsc"
+          runsc = "/usr/lib/gvisor/runsc"
           [gateway]
           port = 8089
           scanner = "enforce"
