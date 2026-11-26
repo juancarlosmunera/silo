@@ -28,9 +28,11 @@ What has to be correct for the above to hold:
 
 - the host kernel (namespaces, seccomp, cgroups, SELinux enforcement);
 - Podman, crun and conmon, and the SELinux container policy;
-- silo's launcher, connector and gateway: about 1,500 lines of Python (`sandbox.py`, `seccomp.py`, `runtime.py`, `connector.py`,
+- silo's launcher, connector and gateway: about 1,800 lines of Python (`sandbox.py`, `seccomp.py`, `runtime.py`, `connector.py`,
   `gateway.py`), standard library only;
 - the base seccomp profile shipped by the distribution, which silo tightens but does not replace;
+- with `runtime.runsc`: gVisor (`runsc`, its sentry and its gofer), which then stands where the host
+  kernel's system call interface stood, and without SELinux around it;
 - `silo.toml`, which chooses the image, the model directory and the seccomp base. It is read only
   from an explicit path or the user's configuration directory, never from the current directory,
   and silo prints which file it used whenever it launches something.
@@ -141,6 +143,32 @@ Described in the README. The properties that matter here:
 - Text from a sandbox, a model file or a model directory is escaped before silo prints it, so
   GGUF metadata, file names and runtime logs cannot drive the operator's terminal.
 
+### On gVisor (optional)
+
+With `runtime.runsc` the same sandbox is started on gVisor's user-space kernel
+(`docs/GVISOR.md`). What changes in the routes above:
+
+- **Kernel.** The runtime's system calls are served by gVisor's sentry. The host kernel sees only
+  the sentry's own calls, behind gVisor's seccomp filter. silo's seccomp profile is still applied
+  to the runtime, by gVisor.
+- **Privilege.** silo turns gVisor's `directfs` off, so the sentry runs as the sandbox's
+  subordinate UID with no capabilities and an empty bounding set, in a user namespace that maps
+  that one UID, and reaches files only through the gofer. The gofer runs as the invoking user in a
+  user namespace, with a seccomp filter; the container's root and the model directory are mounted
+  read-only for it.
+- **SELinux** does not confine the sandbox: `runsc` refuses SELinux labels, and its processes run
+  in the container runtime's domain.
+- **The runtime's socket.** An abstract socket would stay inside gVisor's kernel, so one host
+  directory is shared for the socket. silo locks it (owned by the user, writable by nobody else)
+  as soon as the socket appears, fails the launch if anything else is in it, and the gateway checks
+  the lock, the socket and the listener's UID on every connection.
+- **Resources.** Rootless `runsc` cannot set up cgroups. silo starts Podman inside a systemd user
+  scope that carries the memory, swap, task and CPU limits for the whole gVisor sandbox, and
+  refuses to start without one.
+
+Verified by the same probes, with `kernel.gvisor`, `fs.socket_dir_locked` and `fs.no_shared_dir`
+(the socket directory must be the only writable host mount) in addition.
+
 ## Residual risk
 
 Stated plainly, in rough order of importance.
@@ -149,10 +177,11 @@ Stated plainly, in rough order of importance.
    `mmap`, `execve` and the socket calls for `AF_UNIX`. A bug behind any of them is a way out, and
    SELinux and the user namespace are then the only things left. Use `seccomp_action = "kill"` so a
    probing exploit dies on its first denied call, keep the kernel patched, and apply the host
-   sysctls. The real fix is a second boundary around the kernel. silo offers two, both outside the
-   sandbox itself: a local VM with no network device (`docs/LOCAL_VM.md`), and a dedicated server
-   that holds nothing and cannot start a connection (`docs/VPS.md`). Without one of them, the
-   host kernel is the only thing between a compromised runtime and your account.
+   sysctls. The real fix is a second boundary around the kernel. silo offers three: gVisor's
+   user-space kernel in place of the host's (`docs/GVISOR.md`), a local VM with no network device
+   (`docs/LOCAL_VM.md`), and a dedicated server that holds nothing and cannot start a connection
+   (`docs/VPS.md`). Without one of them, the host kernel is the only thing between a compromised
+   runtime and your account.
 2. **The person reading the output.** A contained model can still write "run this". The tripwire
    recognises common shapes and can be evaded by any model capable enough to matter. Treat output
    as untrusted input, especially commands.
@@ -177,6 +206,11 @@ Stated plainly, in rough order of importance.
    missing. `silo doctor` fails such a host and `silo probe` reports it.
 10. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
     delivered. Only `enforce` withholds.
+11. **gVisor sandboxes.** They exchange one layer for another. SELinux does not confine them. The
+    socket directory is shared, and writable from inside from container start until the runtime
+    has bound its socket: a model file that took over the runtime that early could put files there,
+    which fails the launch but could fill the runtime directory for a moment. And gVisor's own
+    kernel, with its bugs, is now in the path.
 
 ## Not goals
 
@@ -187,7 +221,6 @@ Stated plainly, in rough order of importance.
 
 ## Roadmap
 
-- gVisor (`runsc`) as the sandbox runtime: a second kernel boundary without a whole VM.
 - Mandatory access control for the sandbox on AppArmor hosts.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - Locking down `execve` after the runtime has started.

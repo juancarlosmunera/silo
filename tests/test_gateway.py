@@ -478,6 +478,24 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/health")[0], 503)
         self.assertEqual(FakeLlama.seen, [])
 
+    def test_gvisor_sandboxes_are_dialled_at_their_own_socket(self):
+        cfg = Config(name="test")
+        self.assertEqual(gateway.runtime_path(cfg), cfg.control_path)
+        cfg.runtime.runsc = Path("/usr/local/bin/runsc")
+        self.assertEqual(gateway.runtime_path(cfg), cfg.gvisor_socket_path)
+        directory = Path(self.tmp.name) / "gv"
+        directory.mkdir()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(directory / "llama.sock"))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        dial = gateway.runtime_dialer(cfg, directory / "llama.sock")
+        with self.assertRaises(ConnectionRefusedError):  # 0777: not locked yet
+            os.chmod(directory, 0o777)
+            dial(2)
+        os.chmod(directory, 0o755)
+        dial(2).close()  # locked, a socket, and the listener runs as this user (as gVisor's gofer does)
+
     def test_audit_log_permissions(self):
         self.start()
         self.request("GET", "/health")

@@ -145,7 +145,11 @@ def cmd_up(cfg: Config, args) -> int:
     _announce(cfg)
     _note(f"silo[{cfg.name}] starting {cfg.container_name} from {cfg.runtime.image}")
     runtime.up(cfg, verify=not args.no_verify, full_verify=args.full_verify)
-    _note(f"silo[{cfg.name}] model healthy, reached through {cfg.control_path} (connector; no shared directory)")
+    if runtime.gvisor(cfg):
+        _note(f"silo[{cfg.name}] model healthy on gVisor ({cfg.runtime.gvisor_platform}), reached through "
+              f"{cfg.gvisor_socket_path} (socket directory locked)")
+    else:
+        _note(f"silo[{cfg.name}] model healthy, reached through {cfg.control_path} (connector; no shared directory)")
     if args.detach:
         return 0
     try:
@@ -160,8 +164,9 @@ def cmd_up(cfg: Config, args) -> int:
 
 def cmd_gateway(cfg: Config, args) -> int:
     _announce(cfg)
-    if not runtime.connector_serving(cfg):
-        raise runtime.LaunchError(f"no connector at {cfg.control_path}; start the sandbox with `silo up --detach` first")
+    if not runtime.runtime_reachable(cfg):
+        raise runtime.LaunchError(f"no running sandbox behind {gateway.runtime_path(cfg)}; start it with "
+                                  "`silo up --detach` first")
     try:
         gateway.serve(cfg)
     except KeyboardInterrupt:
