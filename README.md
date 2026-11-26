@@ -383,5 +383,4 @@ that persuades a person, is known. Concrete improvements for those are welcome a
 
 ## License
 
-No license has been chosen yet. Until one is added, default copyright applies: you can read and
-fork the code on GitHub, but you have no license to use, modify or redistribute it.
+MIT. See [LICENSE](LICENSE).
