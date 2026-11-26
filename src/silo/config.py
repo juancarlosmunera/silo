@@ -13,6 +13,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import stat
 import tomllib
 import types
 import typing
@@ -210,8 +211,12 @@ def _check_runsc(path: Path) -> None:
         raise ConfigError("runtime.runsc must not contain ':', ',', '=' or spaces")
     if not path.is_file() or not os.access(path, os.X_OK):
         raise ConfigError(f"runtime.runsc = {path} is not an executable file")
-    for item in (path, path.parent):
-        if item.stat().st_mode & 0o022:
+    for item in (path, *path.parents):
+        mode = item.stat().st_mode
+        # Whoever can write to a directory can swap what is in it. A sticky directory (/tmp, /var/tmp) only
+        # lets users replace their own entries, so it is acceptable above the directory that holds runsc.
+        sticky_ancestor = item not in (path, path.parent) and mode & stat.S_ISVTX
+        if mode & 0o022 and not sticky_ancestor:
             raise ConfigError(f"runtime.runsc: {item} is writable by group or others; whoever can replace the "
                               "runtime controls the sandbox")
     blocked = [str(p) for p in (path, *path.parents) if not p.stat().st_mode & (0o005 if p == path else 0o001)]

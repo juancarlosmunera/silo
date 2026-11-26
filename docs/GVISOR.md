@@ -66,8 +66,10 @@ The archive holds `runsc` and a `gvisor-bin/` directory that has to stay next to
 [What silo asks of gVisor](#what-silo-asks-of-gvisor)), and the sentry then runs as the sandbox's
 unprivileged UID. That UID has to be able to execute `runsc`, which it cannot do inside a home
 directory other users cannot enter. silo checks this and says which directory is in the way. It
-also refuses a `runsc` that group or others could replace: whoever can change the runtime controls
-the sandbox, which is the reason to prefer a directory owned by root.
+also refuses a `runsc` that group or others could replace, by writing to it or to any directory
+above it: whoever can change the runtime controls the sandbox. That is the reason to prefer a
+directory owned by root. If `/usr/local/bin` is writable by others on your machine, as it is on
+some CI images, unpack gVisor into a directory of its own, for example `/usr/lib/gvisor`.
 
 ## 2. Configure
 
