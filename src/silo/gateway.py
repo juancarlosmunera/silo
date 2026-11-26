@@ -14,7 +14,8 @@ piping bytes:
     nosniff + a deny-all CSP, so a compromised runtime cannot serve HTML or script to a browser that
     happens to open the gateway URL;
   * no client headers reach the model, no upstream headers reach the client;
-  * loopback Host check (DNS rebinding) and no browser-originated requests (Origin);
+  * loopback Host check (DNS rebinding), and browser-originated requests (Origin) only from the
+    exact origins in gateway.allowed_origins, with CORS preflight answered by the gateway itself;
   * tool calling is refused unless gateway.allow_tools is set: by default the model can only emit text.
     When it is set, silo.toolpolicy limits which tools a request may offer (gateway.tools) and the
     model may only call a tool the request offered, with capped arguments;
@@ -63,6 +64,8 @@ RESPONSE_HEADERS = (
     ("Referrer-Policy", "no-referrer"),
 )
 CLIENT_IO_TIMEOUT = 30  # seconds a client may stall on a single read or write
+CORS_MAX_AGE = "600"
+_TOKEN_CHARS = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyz")
 
 
 class Reject(Exception):
@@ -158,6 +161,7 @@ class Gateway:
         self.audit = audit or AuditLog(cfg.audit_log)
         self.slots = threading.BoundedSemaphore(self.gw.max_concurrency)
         self.loopback_only = ipaddress.ip_address(self.gw.listen).is_loopback
+        self.allowed_origins = frozenset(self.gw.allowed_origins)
         self.api_key = os.environ.get(self.gw.api_key_env) if self.gw.api_key_env else None
         if self.gw.api_key_env and not self.api_key:
             raise ConfigError(f"gateway.api_key_env={self.gw.api_key_env} is set but the variable is empty")
@@ -178,6 +182,7 @@ def _make_handler(gw: Gateway):
         _started = False
         _audited = False
         _sse = False
+        _cors: str | None = None
 
         def version_string(self) -> str:
             return "silo"
@@ -228,6 +233,9 @@ def _make_handler(gw: Gateway):
                 self.send_header("Content-Type", ctype)
                 for name, value in RESPONSE_HEADERS:
                     self.send_header(name, value)
+                if self._cors is not None:
+                    self.send_header("Access-Control-Allow-Origin", self._cors)
+                    self.send_header("Vary", "Origin")
                 if body is not None:
                     self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -269,6 +277,7 @@ def _make_handler(gw: Gateway):
 
         def _handle(self, method: str) -> None:
             self._t0, self._started, self._audited, self._sse = time.monotonic(), False, False, False
+            self._cors = None
             path = _route(self.path)
             entry = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -280,7 +289,10 @@ def _make_handler(gw: Gateway):
             }
             held = False
             try:
-                body, stream, offered = self._admit(method, path, entry)
+                admitted = self._admit(method, path, entry)
+                if admitted is None:  # answered by the gateway itself (CORS preflight)
+                    return
+                body, stream, offered = admitted
                 if not gw.slots.acquire(timeout=5):
                     raise Reject(429, "too many concurrent requests")
                 held = True
@@ -305,14 +317,20 @@ def _make_handler(gw: Gateway):
                 if held:
                     gw.slots.release()
 
-        def _admit(self, method: str, path: str, entry: dict) -> tuple[bytes, bool, list[str]]:
+        def _admit(self, method: str, path: str, entry: dict) -> tuple[bytes, bool, list[str]] | None:
             """Every check a request must pass before anything is sent to the model."""
             if gw.loopback_only and _hostname(self.headers.get("Host", "")) not in LOOPBACK_HOSTS:
                 raise Reject(403, "Host header is not a loopback name (DNS-rebinding protection)")
-            if self.headers.get("Origin") is not None:
-                raise Reject(403, "browser-originated requests are not accepted")
+            origins = self.headers.get_all("Origin") or []
+            if origins:
+                if len(origins) != 1 or origins[0] not in gw.allowed_origins:
+                    raise Reject(403, "browser origin not allowed (gateway.allowed_origins)")
+                self._cors = entry["origin"] = origins[0]
             if path not in ROUTES:
                 raise Reject(404, "route not allowed by silo")
+            if method == "OPTIONS" and self._cors is not None:
+                self._preflight(path, entry)
+                return None
             if method not in ROUTES[path]:
                 raise Reject(405, "method not allowed")
             if gw.api_key is not None:
@@ -354,6 +372,39 @@ def _make_handler(gw: Gateway):
             if offered:
                 entry["tools_offered"] = offered
             return body, stream, offered
+
+        def _preflight(self, path: str, entry: dict) -> None:
+            """Answer a CORS preflight from an allowed origin. Nothing reaches the model.
+
+            Any syntactically valid request header may be announced: the gateway forwards no client
+            header to the model, so allowing one to be sent costs nothing, and browser SDKs send their own.
+            """
+            method = self.headers.get("Access-Control-Request-Method", "")
+            if method not in ROUTES[path]:
+                raise Reject(403, "preflight for a method this route does not allow")
+            requested = [h.strip().lower() for h in self.headers.get("Access-Control-Request-Headers", "").split(",")]
+            requested = [h for h in requested if h]
+            if any(not set(h) <= _TOKEN_CHARS for h in requested):
+                raise Reject(400, "malformed Access-Control-Request-Headers")
+            entry.update(status=204, preflight=method)
+            self._audit(entry)
+            self._started = True
+            try:
+                self.send_response(204)
+                for name, value in RESPONSE_HEADERS:
+                    self.send_header(name, value)
+                self.send_header("Access-Control-Allow-Origin", self._cors)
+                self.send_header("Access-Control-Allow-Methods", method)
+                if requested:
+                    self.send_header("Access-Control-Allow-Headers", ", ".join(requested))
+                if self.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
+                    self.send_header("Access-Control-Allow-Private-Network", "true")
+                self.send_header("Access-Control-Max-Age", CORS_MAX_AGE)
+                self.send_header("Vary", "Origin")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except OSError as exc:
+                raise ClientGone from exc
 
         # --------------------------------------------------------------------------------- upstream
 
