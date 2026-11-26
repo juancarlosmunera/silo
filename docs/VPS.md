@@ -285,7 +285,7 @@ ruleset is the best available, and it stops everything short of root.
 
 **Ubuntu 24.04** (kernel 6.8, Podman 4.9, installed with `apt-get install podman`): silo runs, the
 service and the tunnel work, the kernel settings and both firewall rulesets load, and 65 of the 66
-escape probes pass. The one that does not is confinement by a mandatory access control policy.
+escape probes of silo 0.1 pass. The one that does not is confinement by a mandatory access control policy.
 Rootless Podman gets none on Ubuntu: Podman reports AppArmor as not enabled for rootless
 containers and refuses an explicit profile, so the sandbox process runs unconfined by any LSM.
 `silo doctor` fails the host on that line, and `silo probe` reports

@@ -78,6 +78,11 @@ def cmd_seccomp(cfg: Config, args) -> int:
     else:
         why = "gVisor has no seccomp user notification" if runtime.gvisor(cfg) else "runtime.exec_lock = false"
         print(f"execve()/execveat(): allowed ({why})")
+    if cfg.runtime.gpu == "none":
+        print(f"argument allowlists: ioctl ({len(seccomp.IOCTL_ALLOW)} requests), prctl ({len(seccomp.PRCTL_ALLOW)} "
+              f"options), setsockopt ({sum(map(len, seccomp.SETSOCKOPT_ALLOW.values()))} options)")
+    else:
+        print("argument allowlists: off (GPU passthrough needs device ioctls)")
     print(f"deny action: {cfg.runtime.seccomp_action}")
     return 0
 

@@ -59,7 +59,7 @@ first item under [Limits](#limits).
 | Way out | Control |
 |---|---|
 | **Network** | `--network=none`: a private loopback, no routes, no resolver. Independently, seccomp allows `socket()` and `socketpair()` for `AF_UNIX` only and denies the ways around that filter: io_uring, `socketcall`, and the 32-bit and x32 syscall ABIs. Optionally, a host firewall rule drops everything the sandbox user originates ([host/](host/README.md)). |
-| **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. |
+| **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. On CPU-only sandboxes, `ioctl`, `prctl` and `setsockopt` are limited to the argument values an inference server uses, measured on llama-server: no driver ioctls, no socket filters. |
 | **Privilege** | Rootless Podman, so container root is not host root. The runtime runs as `nobody`, mapped to a subordinate UID that owns nothing on the host. Every capability dropped, bounding set included. `no-new-privileges`. SELinux `container_t` with per-container categories. |
 | **Filesystem, persistence** | Read-only root. Model directory mounted read-only. The only writable location is a 64 MB `noexec` tmpfs. No `memfd_create` on CPU-only sandboxes, so no fileless exec either. Environment stripped. No Podman, D-Bus, display, audio or agent sockets visible. |
 | **Running other programs** | Once the runtime has started, nothing else can be executed in the sandbox. Every `execve` is put to a supervisor on the host, which lets the container's own first one through and refuses the rest. The shell, `curl` and Python that ship in the runtime image are of no use to a compromised runtime, and neither is a binary it brought along. Not available on gVisor. |
@@ -75,15 +75,16 @@ The reasoning behind each control, and what is left over, is in
 ## Check it yourself
 
 None of the above is taken on trust. `silo probe` starts a sandbox with exactly the flags the model
-gets and runs 67 probes inside it: reach the network through a dozen socket types, create
-namespaces, call the kernel interfaces listed above, start a second program, find a location that is both writable and
+gets and runs 73 probes inside it: reach the network through a dozen socket types, create
+namespaces, call the kernel interfaces listed above, use syscall arguments outside the allowlists,
+start a second program, find a location that is both writable and
 executable, find host sockets and credentials, and check the process's own privileges and limits.
 `silo probe --baseline` runs the same probes in a stock rootless Podman container.
 
 | | stock rootless Podman | silo |
 |---|---|---|
-| contained (PASS) | 26 | 67 |
-| not contained (FAIL) | 33 | 0 |
+| contained (PASS) | 27 | 73 |
+| not contained (FAIL) | 38 | 0 |
 | weaker than intended (WARN) | 7 | 0 |
 
 These are the numbers from the development machine. One probe is skipped in the baseline because
@@ -170,7 +171,7 @@ silo probe      # run the escape probes in a sandbox identical to the model's
  PASS sys.unshare                    unshare(CLONE_NEWUSER): refused (EPERM)
  PASS fs.writable_noexec             writable locations ['/tmp'] are all noexec
  ...
-PASS=67  FAIL=0  WARN=0  SKIP=0
+PASS=73  FAIL=0  WARN=0  SKIP=0
 ```
 
 **4. Start it.**
@@ -377,7 +378,6 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 ## Roadmap
 
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
-- Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - Verification on NVIDIA and AMD GPUs, aarch64 and hosts without SELinux.
 
 ## Development

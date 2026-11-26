@@ -561,7 +561,8 @@ def probe(cfg: Config, baseline: bool = False) -> tuple[int, list[dict]]:
             mounts.append(sandbox.Mount(shared, GVISOR_SOCKET_DIR_IN_CONTAINER, writable=True))
         locked = exec_lock(cfg)
         profile = prepare_seccomp(cfg, exec_dir=scratch if locked else None, probe=True)
-        flags = [*(["--gvisor"] if gvisor(cfg) else []), *([] if locked else ["--no-exec-lock"])]
+        flags = [*(["--gpu"] if cfg.runtime.gpu != "none" else []), *(["--gvisor"] if gvisor(cfg) else []),
+                 *([] if locked else ["--no-exec-lock"])]
         args = scoped(cfg, sandbox.podman_run_args(
             cfg, name=f"{cfg.container_name}-probe", image=image, command=["python3", "-I", "-", *flags],
             seccomp_profile=profile, mounts=mounts, interactive=True, memory="512m", gpu=cfg.runtime.gpu,

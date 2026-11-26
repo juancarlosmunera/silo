@@ -38,6 +38,9 @@ GVISOR_DEV = {"fuse", "net", "char"}  # emulated inside gVisor's kernel, not hos
 # The launcher passes --no-exec-lock when execve is not decided by silo's supervisor: switched off in
 # silo.toml, or a gVisor sandbox, where the kernel feature behind it does not exist.
 EXEC_LOCK = "--no-exec-lock" not in sys.argv[1:]
+# The launcher passes --gpu when the sandbox has GPU passthrough: the argument allowlists for ioctl,
+# prctl and setsockopt are then not applied (GPU drivers need device ioctls), which is reported as WARN.
+GPU = "--gpu" in sys.argv[1:]
 
 SYSNR = {
     "x86_64": {
@@ -45,12 +48,14 @@ SYSNR = {
         "perf_event_open": 298, "open_by_handle_at": 304, "setns": 308, "process_vm_readv": 310,
         "bpf": 321, "userfaultfd": 323, "socketpair": 53, "msgget": 68, "io_setup": 206,
         "remap_file_pages": 216, "mq_open": 240, "splice": 275, "vmsplice": 278,
+        "ioctl": 16, "prctl": 157, "setsockopt": 54,
     },
     "aarch64": {
         "socket": 198, "ptrace": 117, "mount": 40, "keyctl": 219, "add_key": 217, "unshare": 97,
         "perf_event_open": 241, "open_by_handle_at": 265, "setns": 268, "process_vm_readv": 270,
         "bpf": 280, "userfaultfd": 282, "socketpair": 199, "msgget": 186, "io_setup": 0,
         "remap_file_pages": 234, "mq_open": 180, "splice": 76, "vmsplice": 75,
+        "ioctl": 29, "prctl": 167, "setsockopt": 208,
     },
 }
 # Unified numbering for syscalls added after 5.1 (same on every architecture).
@@ -114,7 +119,7 @@ def describe(kind, value):
     return str(value)
 
 
-def judge_syscall(probe, outcome, what):
+def judge_syscall(probe, outcome, what, fail_as="FAIL", note=""):
     kind, value = outcome
     if kind == "signal":
         sig = signal.Signals(value).name if value in signal.Signals._value2member_map_ else value
@@ -127,10 +132,10 @@ def judge_syscall(probe, outcome, what):
         return record(probe, "WARN", f"{what}: probe error {value}")
     ret, err = value
     if ret >= 0:
-        return record(probe, "FAIL", f"{what}: succeeded (ret={ret})")
+        return record(probe, fail_as, f"{what}: succeeded (ret={ret}){note}")
     if err in REFUSED:
         return record(probe, "PASS", f"{what}: refused ({errno.errorcode.get(err, err)})")
-    return record(probe, "FAIL", f"{what}: reached the kernel (errno {errno.errorcode.get(err, err)})")
+    return record(probe, fail_as, f"{what}: reached the kernel (errno {errno.errorcode.get(err, err)}){note}")
 
 
 def nr(name):
@@ -749,6 +754,63 @@ def probe_pty():
     record("dev.pty", "PASS", "no pseudo-terminal can be allocated")
 
 
+class SockFilter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8), ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(SockFilter))]
+
+
+def probe_argument_filters():
+    """ioctl, prctl and setsockopt with values outside silo's allowlists. Each succeeds in a stock container."""
+    numbers = {name: nr(name) for name in ("ioctl", "prctl", "setsockopt")}
+    if None in numbers.values():
+        return record("args.allowlists", "SKIP", f"no syscall numbers for {MACHINE}")
+
+    def ioctl(cmd):
+        def run():
+            fd = os.open("/etc/passwd", os.O_RDONLY)
+            out = ctypes.c_int(0)
+            return raw_syscall(numbers["ioctl"], fd, cmd, ctypes.addressof(out))
+        return run
+
+    def setsockopt(level, name, value_ptr, size):
+        a, _b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        return raw_syscall(numbers["setsockopt"], a.fileno(), level, name, value_ptr, size)
+
+    def passcred():
+        one = ctypes.c_int(1)
+        return setsockopt(1, 16, ctypes.addressof(one), 4)  # SOL_SOCKET, SO_PASSCRED
+
+    def attach_filter():
+        accept_all = (SockFilter * 1)(SockFilter(0x06, 0, 0, 0xFFFFFFFF))  # BPF_RET|BPF_K
+        prog = SockFprog(1, accept_all)
+        return setsockopt(1, 26, ctypes.addressof(prog), ctypes.sizeof(prog))  # SO_ATTACH_FILTER
+
+    cases = [
+        ("args.ioctl_unlisted", ioctl(2), "ioctl(FIGETBSZ) on a regular file"),
+        ("args.ioctl_upper_bits", ioctl(0x5401 | 1 << 32), "ioctl(TCGETS with stray upper bits)"),
+        ("args.prctl_unlisted", lambda: raw_syscall(numbers["prctl"], 36, 1, 0, 0, 0),
+         "prctl(PR_SET_CHILD_SUBREAPER)"),
+        ("args.setsockopt_unlisted", passcred, "setsockopt(SO_PASSCRED) on a UNIX socket"),
+        ("args.socket_filter", attach_filter, "setsockopt(SO_ATTACH_FILTER): classic BPF without bpf()"),
+    ]
+    fail_as, note = ("WARN", " (argument allowlists are off with GPU passthrough)") if GPU else ("FAIL", "")
+    for probe, fn, what in cases:
+        judge_syscall(probe, in_child(fn), what, fail_as, note)
+    # and what the runtime needs still works
+    def allowed():
+        a, _b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        waiting = ctypes.c_int(-1)
+        return raw_syscall(numbers["ioctl"], a.fileno(), 0x541B, ctypes.addressof(waiting))  # FIONREAD
+    kind, value = in_child(allowed)
+    if kind == "ok" and value[0] == 0:
+        record("args.allowlisted", "PASS", "allowlisted calls still work (ioctl FIONREAD)")
+    else:
+        record("args.allowlisted", "WARN", f"an allowlisted call was refused: {describe(kind, value)}")
+
+
 def probe_kernel_leaks():
     try:
         with open("/proc/kallsyms") as fh:
@@ -787,7 +849,8 @@ def main():
                probe_tcp_egress, probe_abstract_unix, probe_syscalls, probe_clone_newuser, probe_compat_abi,
                probe_readonly, probe_socket_dir, probe_tmp_noexec, probe_memfd_exec, probe_mounts,
                probe_host_artifacts, probe_credentials, probe_pid_namespace, probe_exec_lock, probe_lsm,
-               probe_environment, probe_cgroup_limits, probe_devices, probe_pty, probe_kernel_leaks):
+               probe_environment, probe_cgroup_limits, probe_devices, probe_pty, probe_argument_filters,
+               probe_kernel_leaks):
         try:
             fn()
         except Exception as exc:  # noqa: BLE001 - a crashing probe must not hide the others
