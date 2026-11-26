@@ -15,7 +15,9 @@ piping bytes:
     happens to open the gateway URL;
   * no client headers reach the model, no upstream headers reach the client;
   * loopback Host check (DNS rebinding) and no browser-originated requests (Origin);
-  * tool calling is refused unless gateway.allow_tools is set: by default the model can only emit text;
+  * tool calling is refused unless gateway.allow_tools is set: by default the model can only emit text.
+    When it is set, silo.toolpolicy limits which tools a request may offer (gateway.tools) and the
+    model may only call a tool the request offered, with capped arguments;
   * size caps both ways, one total deadline per request, bounded concurrency;
   * output tripwire (silo.scanner) on every completion; in enforce mode streams are held until they
     finish clean, so a blocked completion is never partially delivered;
@@ -40,7 +42,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from silo import scanner
+from silo import scanner, toolpolicy
 from silo.config import Config, ConfigError
 
 ROUTES: dict[str, set[str]] = {
@@ -52,7 +54,7 @@ ROUTES: dict[str, set[str]] = {
 }
 JSON_TYPE = "application/json"
 SSE_TYPE = "text/event-stream"
-TOOL_KEYS = ("tools", "tool_choice", "functions", "function_call", "parallel_tool_calls")
+TOOL_KEYS = toolpolicy.TOOL_KEYS
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 RESPONSE_HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
@@ -278,12 +280,13 @@ def _make_handler(gw: Gateway):
             }
             held = False
             try:
-                body, stream = self._admit(method, path, entry)
+                body, stream, offered = self._admit(method, path, entry)
                 if not gw.slots.acquire(timeout=5):
                     raise Reject(429, "too many concurrent requests")
                 held = True
-                self._proxy(method, path, body, stream, entry)
-            except Reject as reject:
+                calls = toolpolicy.CallChecker(offered, cfg.max_tool_arguments_bytes)
+                self._proxy(method, path, body, stream, calls, entry)
+            except (Reject, toolpolicy.ToolPolicyError) as reject:
                 self._fail(reject.status, reject.message, entry)
             except ClientGone:
                 entry.update(status=499, error="client disconnected")
@@ -302,7 +305,7 @@ def _make_handler(gw: Gateway):
                 if held:
                     gw.slots.release()
 
-        def _admit(self, method: str, path: str, entry: dict) -> tuple[bytes, bool]:
+        def _admit(self, method: str, path: str, entry: dict) -> tuple[bytes, bool, list[str]]:
             """Every check a request must pass before anything is sent to the model."""
             if gw.loopback_only and _hostname(self.headers.get("Host", "")) not in LOOPBACK_HOSTS:
                 raise Reject(403, "Host header is not a loopback name (DNS-rebinding protection)")
@@ -317,7 +320,7 @@ def _make_handler(gw: Gateway):
                 if not hmac.compare_digest(supplied.encode(), f"Bearer {gw.api_key}".encode()):
                     raise Reject(401, "missing or invalid API key")
             if method != "POST":
-                return b"", False
+                return b"", False, []
 
             if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != JSON_TYPE:
                 raise Reject(415, "Content-Type must be application/json")
@@ -347,14 +350,15 @@ def _make_handler(gw: Gateway):
                          model=model[:200] if isinstance(model, str) else None)
             if cfg.log_content:
                 entry["request"] = request
-            tool_keys = [k for k in TOOL_KEYS if k in request]
-            if tool_keys and not cfg.allow_tools:
-                raise Reject(403, f"tool calling is disabled (gateway.allow_tools = false): {', '.join(tool_keys)}")
-            return body, stream
+            offered = toolpolicy.offered_tools(request, cfg.allow_tools, cfg.tools)
+            if offered:
+                entry["tools_offered"] = offered
+            return body, stream, offered
 
         # --------------------------------------------------------------------------------- upstream
 
-        def _proxy(self, method: str, path: str, body: bytes, stream: bool, entry: dict) -> None:
+        def _proxy(self, method: str, path: str, body: bytes, stream: bool, calls: toolpolicy.CallChecker,
+                   entry: dict) -> None:
             deadline = self._t0 + cfg.timeout
             conn = UnixHTTPConnection(gw.socket_path, timeout=cfg.timeout)
             try:
@@ -371,9 +375,9 @@ def _make_handler(gw: Gateway):
                 if ctype == SSE_TYPE:
                     if not stream or status != 200:
                         raise Reject(502, "unexpected event stream from model sandbox")
-                    self._relay_stream(resp, sock, deadline, entry)
+                    self._relay_stream(resp, sock, deadline, calls, entry)
                 elif ctype == JSON_TYPE:
-                    self._relay_json(resp, sock, status, deadline, entry)
+                    self._relay_json(resp, sock, status, deadline, calls, entry)
                 else:
                     raise Reject(502, "unexpected content type from model sandbox")
             finally:
@@ -389,7 +393,7 @@ def _make_handler(gw: Gateway):
                 pass
             return resp.read1(65536)
 
-        def _relay_json(self, resp, sock, status: int, deadline: float, entry: dict) -> None:
+        def _relay_json(self, resp, sock, status: int, deadline: float, calls, entry: dict) -> None:
             data = bytearray()
             while chunk := self._read_some(resp, sock, deadline):
                 data += chunk
@@ -409,13 +413,14 @@ def _make_handler(gw: Gateway):
                 entry["response_text"] = text
             if scanner.has_tool_calls(payload) and not cfg.allow_tools:
                 raise Reject(502, "model emitted tool calls while gateway.allow_tools = false")
+            calls.check(payload)
             if cfg.scanner == "enforce" and scanner.blocking(findings):
                 raise Reject(502, "completion blocked by silo output policy")
             entry["status"] = status
             self._audit(entry)  # the record exists before the client can act on the output
             self._send(status, JSON_TYPE, out)
 
-        def _relay_stream(self, resp, sock, deadline: float, entry: dict) -> None:
+        def _relay_stream(self, resp, sock, deadline: float, calls, entry: dict) -> None:
             hold = cfg.scanner == "enforce"  # deliver nothing until the whole completion is known clean
             stream_scan = scanner.StreamScanner()
             digest = hashlib.sha256()
@@ -462,6 +467,7 @@ def _make_handler(gw: Gateway):
                             raise Reject(502, "model sandbox sent a malformed stream event")
                         if scanner.has_tool_calls(payload) and not cfg.allow_tools:
                             raise Reject(502, "model emitted tool calls while gateway.allow_tools = false")
+                        calls.check(payload)
                         delta = scanner.extract_text(payload)
                         tools.extend(scanner.tool_call_names(payload))
                         if cfg.log_content:
@@ -487,14 +493,20 @@ def _make_handler(gw: Gateway):
     return Handler
 
 
+def tools_summary(cfg: Config) -> str:
+    if not cfg.gateway.allow_tools:
+        return "refused"
+    return f"allowed({','.join(cfg.gateway.tools)})" if cfg.gateway.tools else "allowed(any)"
+
+
 def serve(cfg: Config, socket_path: Path | None = None) -> None:
     gw = Gateway(cfg, socket_path)
     srv = gw.server()
     host, port = srv.server_address[:2]
     shown = f"[{host}]" if ":" in host else host
     print(f"silo[{cfg.name}] gateway on http://{shown}:{port}/v1  ->  {gw.socket_path}", file=sys.stderr)
-    print(f"silo[{cfg.name}] scanner={cfg.gateway.scanner} tools={'allowed' if cfg.gateway.allow_tools else 'refused'}"
-          f" audit={gw.audit.path}", file=sys.stderr, flush=True)
+    print(f"silo[{cfg.name}] scanner={cfg.gateway.scanner} tools={tools_summary(cfg)} audit={gw.audit.path}",
+          file=sys.stderr, flush=True)
     try:
         srv.serve_forever()
     finally:

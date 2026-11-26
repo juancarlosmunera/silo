@@ -321,6 +321,7 @@ def status(cfg: Config) -> dict:
         "gateway": f"http://{cfg.gateway.listen}:{cfg.gateway.port}/v1",
         "scanner": cfg.gateway.scanner,
         "allow_tools": cfg.gateway.allow_tools,
+        "tools": list(cfg.gateway.tools),
         "audit_log": str(cfg.audit_log),
     }
 

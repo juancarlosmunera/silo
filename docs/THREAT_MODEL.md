@@ -156,7 +156,9 @@ Stated plainly, in rough order of importance.
 3. **The client.** A chat UI that renders markdown will fetch a remote image by itself, with data
    in the URL. An agent harness will execute tool calls. Both act with the client's network access,
    not the model's. Tool calling is off by default for this reason; if you turn it on, whatever
-   executes the calls is the boundary and needs its own sandbox.
+   executes the calls is the boundary and needs its own sandbox. `gateway.tools` limits which tools
+   can be offered and the model can only call what was offered, but the gateway does not judge a
+   call's arguments beyond size and the output tripwire.
 4. **Local processes.** The gateway listens on loopback, which every process and user on the
    machine can reach. Set `api_key_env` if that matters. The model socket itself is reachable only
    by your user.
@@ -195,6 +197,5 @@ Stated plainly, in rough order of importance.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - Locking down `execve` after the runtime has started.
 - An origin allowlist with proper CORS handling, for browser-based clients.
-- Tool-call mediation: per-tool policy instead of all-or-nothing.
 - Structural validation of GGUF files at intake.
 - The probe suite as a CI gate, and verification on GPU hardware and aarch64.

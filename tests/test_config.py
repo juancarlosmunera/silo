@@ -47,6 +47,13 @@ class ConfigTests(unittest.TestCase):
             '[gateway]\nport = true\n',
             '[gateway]\nallow_tools = 1\n',
             '[gateway]\nallow_tools = "false"\n',
+            # a tool list only means something with tool calling on, and holds API-valid names
+            '[gateway]\ntools = ["read_file"]\n',
+            '[gateway]\nallow_tools = true\ntools = "read_file"\n',
+            '[gateway]\nallow_tools = true\ntools = ["read file"]\n',
+            '[gateway]\nallow_tools = true\ntools = ["a", "a"]\n',
+            '[gateway]\nallow_tools = true\ntools = [""]\n',
+            '[gateway]\nmax_tool_arguments_bytes = 0\n',
             '[runtime]\npids_limit = 64.5\n',
             '[model]\nextra_args = "--jinja"\n',
             '[model]\nextra_args = ["--threads", 4]\n',

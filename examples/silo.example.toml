@@ -47,6 +47,11 @@ scanner = "monitor"
 # false: requests that carry tools/functions are refused and tool calls from the model are cut off.
 # true: whatever executes those tool calls is outside the silo and becomes your boundary.
 allow_tools = false
+# With allow_tools = true: the only tool names a request may offer (empty = any). The model can only
+# call a tool the request offered, whatever this list says.
+# tools = ["read_file", "search_docs"]
+# Cap on the arguments of each tool call the model makes, in bytes.
+max_tool_arguments_bytes = 32768
 # Write prompts and completions into the audit log. Off by default: hashes and findings only.
 log_content = false
 max_request_bytes = 1048576

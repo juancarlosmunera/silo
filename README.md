@@ -273,6 +273,8 @@ The settings that matter most. Every option, with comments, is in
 | `gateway.listen`, `gateway.port` | `127.0.0.1`, `8088` | A non-loopback address is refused unless `api_key_env` is set. |
 | `gateway.scanner` | `"monitor"` | `"off"`, `"monitor"` (log and alert) or `"enforce"` (withhold high-severity completions). |
 | `gateway.allow_tools` | `false` | Tool calling. When on, whatever executes the calls is outside the silo. |
+| `gateway.tools` | `[]` | With tool calling on: the only tool names a request may offer. Empty means any. |
+| `gateway.max_tool_arguments_bytes` | `32768` | Cap on the arguments of each tool call the model makes. |
 | `gateway.log_content` | `false` | Record prompts and completions in the audit log, not only their hashes. |
 | `gateway.api_key_env` | none | Name of an environment variable holding a bearer token that clients must send. |
 
@@ -292,6 +294,11 @@ The gateway treats both sides as untrusted and terminates the protocol instead o
   or a POST that is not `application/json` are refused.
 - **Text only by default.** Requests that carry tools or functions are refused, and tool calls from
   the model are cut off, unless `allow_tools = true`.
+- **Per-tool policy when tools are on.** `gateway.tools` lists the tools a client may offer; anything
+  else is refused before it reaches the model. The model may only call a tool the request offered:
+  a call to anything else, a call that changes its name mid-stream or sends arguments before naming
+  a tool is cut off, and arguments are capped per call. The audit log records the tools offered and
+  the tools called.
 - **Output tripwire.** Completions are scanned for the usual ways text borrows someone else's
   network or hands: pipe-to-shell, reverse shells, remote images that a markdown renderer would
   fetch on its own, raw terminal escape sequences, sandbox-weakening flags, hidden Unicode,
@@ -343,7 +350,6 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 - Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - An origin allowlist with proper CORS handling, for browser-based clients.
-- Per-tool policy for tool calling, in place of all-or-nothing.
 - Verification on GPU hardware, aarch64 and hosts without SELinux.
 
 ## Development
