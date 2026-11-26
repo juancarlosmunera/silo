@@ -122,8 +122,16 @@ anything unknown, hidden directories included. It records size, mtime and SHA-25
 manifest outside the model directory; `silo up` refuses to start if the directory no longer
 matches.
 
+GGUF headers are parsed in full before the runtime sees them (`silo/gguf.py`): every count, length
+and string is bounded by the file, keys and tensor names must be unique, arrays cannot nest,
+`general.alignment` must be a power of two, tensors have one to four dimensions whose product fits
+in int64 and a type from ggml's table, and each tensor's data must be aligned, lie inside the file
+and not overlap another. Crafted files aimed at a loader are usually malformed in exactly these
+places. Unknown tensor types are refused unless `silo intake --allow-unknown` is given.
+
 This is a format gate and an integrity record. It does not prove a GGUF is benign: a well-formed
-file can still carry a hostile chat template or trigger a parser bug. That is what the sandbox is
+file can still carry a hostile chat template or trigger a parser bug the check does not foresee.
+`silo intake` shows the size of each file's chat template so that it can be reviewed. That is what the sandbox is
 for. The default launch check compares size and mtime; `silo up --full-verify` rehashes.
 
 ### The gateway
@@ -196,5 +204,4 @@ Stated plainly, in rough order of importance.
 - Handing the runtime's socket to the gateway without a shared host directory.
 - Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
 - Locking down `execve` after the runtime has started.
-- Structural validation of GGUF files at intake.
 - The probe suite as a CI gate, and verification on GPU hardware and aarch64.

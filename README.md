@@ -63,7 +63,7 @@ first item under [Limits](#limits).
 | **Filesystem, persistence** | Read-only root. Model directory mounted read-only. The only writable location is a 64 MB `noexec` tmpfs. No `memfd_create` on CPU-only sandboxes, so no fileless exec either. Environment stripped. No Podman, D-Bus, display, audio or agent sockets visible. |
 | **The shared socket directory** | The one host directory the sandbox can touch is locked within about a millisecond of the runtime binding its socket. From then on the sandbox cannot fill it or swap the socket for a symlink to another host socket, and anything found in it besides that socket fails the launch. |
 | **Resources** | Memory cap with no swap, PID cap, file-descriptor cap, size-capped log. |
-| **Model files** | `silo intake`: format allowlist (GGUF, safetensors), magic-byte checks, no pickles, code or symlinks, and a SHA-256 manifest kept outside the model directory and checked before every launch. |
+| **Model files** | `silo intake`: format allowlist (GGUF, safetensors), magic-byte checks, GGUF headers parsed in full and every tensor checked against the file, no pickles, code or symlinks, and a SHA-256 manifest kept outside the model directory and checked before every launch. |
 | **The runtime's own features** | llama-server flags that add listeners, downloads, tools, agents, MCP or remote backends are refused. Web UI, slots and the MCP proxy are switched off. Images are never pulled at launch. |
 | **The output** | [The gateway](#the-gateway). |
 
