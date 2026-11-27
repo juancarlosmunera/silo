@@ -79,27 +79,40 @@ def dial_socket(path: str, timeout: float, expect_uid: int | None = None) -> soc
     """Connect to a runtime socket that exists on the host (gVisor sandboxes, see silo.runtime).
 
     The socket sits in a directory silo locked once the runtime had bound it: owned by this user and
-    writable by nobody else. That, and the path itself being a socket, is checked with lstat on
-    every connection, so it can never be a symlink to some other host socket.
+    writable by nobody else. The sandbox could still try to swap the socket for a symlink to another
+    of the user's sockets between a check and the connect, so nothing is looked up twice: the
+    directory and then the socket are opened without following symlinks (O_PATH), checked through
+    those descriptors, and the connection goes to the very file that was checked.
     """
-    parent = os.path.dirname(path)
+    parent, name = os.path.split(path)
+    flags = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        directory, st = os.lstat(parent), os.lstat(path)
+        dirfd = os.open(parent, flags | os.O_DIRECTORY)
     except OSError as exc:
         raise FileNotFoundError(path) from exc
-    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid() or directory.st_mode & 0o022:
-        raise DialError(f"{parent} is not a locked directory owned by this user")
-    if not stat.S_ISSOCK(st.st_mode):
-        raise DialError(f"{path} is not a socket")
+    try:
+        directory = os.fstat(dirfd)
+        if directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+            raise DialError(f"{parent} is not a locked directory owned by this user")
+        try:
+            fd = os.open(name, flags, dir_fd=dirfd)
+        except OSError as exc:
+            raise (DialError(f"{path} is not a socket") if exc.errno == errno.ELOOP else FileNotFoundError(path)) from exc
+    finally:
+        os.close(dirfd)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
+        if not stat.S_ISSOCK(os.fstat(fd).st_mode):
+            raise DialError(f"{path} is not a socket")
         sock.settimeout(timeout)
-        sock.connect(path)
+        sock.connect(f"/proc/self/fd/{fd}")
         _check_peer(sock, expect_uid)
         return sock
     except BaseException:
         sock.close()
         raise
+    finally:
+        os.close(fd)
 
 
 def _check_peer(sock: socket.socket, expect_uid: int | None) -> None:

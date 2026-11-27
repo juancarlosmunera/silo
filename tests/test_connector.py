@@ -121,6 +121,38 @@ class ConnectorTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             connector.dial_socket(str(Path(self.tmp.name) / "nodir" / "llama.sock"), 5)
 
+    def test_dial_socket_cannot_be_raced_onto_another_socket(self):
+        # The sandbox owns the runtime's socket file and may swap it for a symlink to another of the
+        # user's sockets at any moment. No connection may ever end up there.
+        path, srv = self.host_socket()
+        other = Path(self.tmp.name) / "other.sock"
+        decoy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        decoy.bind(str(other))
+        decoy.listen(512)
+        decoy.setblocking(False)
+        self.addCleanup(decoy.close)
+        real, link = path.with_name("real.sock"), path.with_name("swap.sock")
+        os.rename(path, real)
+        stop = threading.Event()
+
+        def swap():
+            while not stop.is_set():
+                os.link(real, link); os.replace(link, path)       # the runtime's socket itself
+                os.symlink(other, link); os.replace(link, path)   # a symlink to the other one
+        swapper = threading.Thread(target=swap, daemon=True)
+        swapper.start()
+        try:
+            for _ in range(5000):
+                try:
+                    connector.dial_socket(str(path), 1).close()
+                except (connector.DialError, FileNotFoundError, OSError):
+                    pass
+        finally:
+            stop.set()
+            swapper.join(5)
+        with self.assertRaises(BlockingIOError):
+            decoy.accept()
+
     def test_refuses_its_own_network_namespace(self):
         with self.assertRaises(RuntimeError):
             connector._join_netns(os.getpid())
