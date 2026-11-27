@@ -50,6 +50,7 @@ FORBIDDEN_SERVER_WORDS = frozenset({
     "tool", "tools", "agent", "mcp", "proxy", "rpc",           # tools, agents, remote backends
     "host", "port", "ssl", "api", "ui", "webui",               # listeners and web UI
     "props", "slot", "slots", "metrics", "media", "models",    # admin/state endpoints, router mode
+    "connect",                                                 # llama-connect peer-to-peer tunnel
 })
 FORBIDDEN_SERVER_FLAGS = frozenset({
     "-m", "--model", "--path", "--log-prompts-dir", "--video-ffmpeg-dir",
@@ -100,8 +101,11 @@ def check_extra_args(extra: list[str]) -> None:
     for arg in extra:
         if not arg.startswith("-"):
             continue
+        # llama.cpp reads `--mcp_servers_json` as `--mcp-servers-json`: compare the same way
         flag = arg.split("=", 1)[0]
-        words = set(flag.lstrip("-").lower().split("-"))
+        if flag.startswith("--"):
+            flag = flag.replace("_", "-").lower()
+        words = set(flag.lstrip("-").split("-"))
         if flag in FORBIDDEN_SERVER_FLAGS or (flag.startswith("--") and words & FORBIDDEN_SERVER_WORDS):
             raise ConfigError(f"model.extra_args: {flag} is not allowed inside a silo")
 

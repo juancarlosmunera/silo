@@ -140,6 +140,24 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(label), self.assertRaises(config.ConfigError):
                 config.load(write(text))
 
+    def test_runsc_owned_by_another_user_is_refused(self):
+        # As seen by a different user, the stand-in runsc and its directory belong to somebody else:
+        # the situation after a /var/tmp cleanup when another user re-creates the configured path.
+        text = f'[runtime]\nrunsc = "{self.runsc()}"\n'
+        with mock.patch("os.getuid", return_value=os.getuid() + 4242):
+            with self.assertRaises(config.ConfigError) as cm:
+                config.load(write(text))
+        self.assertIn("belongs to UID", str(cm.exception))
+
+    def test_runsc_through_a_symlink_is_checked_where_it_points(self):
+        good = self.runsc()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o777)  # anyone could replace the link: Podman must be given the target
+            link = Path(tmp) / "runsc"
+            link.symlink_to(good)
+            cfg = config.load(write(f'[runtime]\nrunsc = "{link}"\n'))
+            self.assertEqual(cfg.runtime.runsc, good.resolve())
+
     def test_private_home_install_is_explained(self):
         with tempfile.TemporaryDirectory() as private:  # 0700, like ~/.local
             path = Path(private) / "runsc"

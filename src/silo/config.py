@@ -212,7 +212,7 @@ def memory_bytes(value: str) -> int:
     return int(digits) * {"": 1, "b": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[value[len(digits):].lower()]
 
 
-def _check_runsc(path: Path) -> None:
+def _check_runsc(path: Path) -> Path:
     """gVisor's runsc: executable, not replaceable by others, and reachable by another UID.
 
     silo runs gVisor with directfs off, so its sentry runs as the sandbox's unprivileged subordinate
@@ -223,8 +223,15 @@ def _check_runsc(path: Path) -> None:
         raise ConfigError("runtime.runsc must not contain ':', ',', '=' or spaces")
     if not path.is_file() or not os.access(path, os.X_OK):
         raise ConfigError(f"runtime.runsc = {path} is not an executable file")
+    path = path.resolve(strict=True)  # the file that is checked is the file Podman is given
     for item in (path, *path.parents):
-        mode = item.stat().st_mode
+        st = item.stat()
+        mode = st.st_mode
+        # Another user's file or directory is theirs to change. A path below /tmp or /var/tmp can
+        # also disappear (reboot, tmpfiles cleanup) and be created again by somebody else.
+        if st.st_uid not in (0, os.getuid()):
+            raise ConfigError(f"runtime.runsc: {item} belongs to UID {st.st_uid}, not to root or to you; "
+                              "whoever owns it controls the sandbox")
         # Whoever can write to a directory can swap what is in it. A sticky directory (/tmp, /var/tmp) only
         # lets users replace their own entries, so it is acceptable above the directory that holds runsc.
         sticky_ancestor = item not in (path, path.parent) and mode & stat.S_ISVTX
@@ -236,6 +243,7 @@ def _check_runsc(path: Path) -> None:
         raise ConfigError(f"runtime.runsc = {path} cannot be executed by the sandbox's unprivileged UID "
                           f"(no access for others to {', '.join(blocked)}). Install gVisor outside your home "
                           "directory, e.g. in /usr/local/bin (docs/GVISOR.md)")
+    return path
 
 
 def _check_origin(origin: str) -> None:
@@ -280,7 +288,7 @@ def validate(cfg: Config) -> Config:
     if rt.runsc is None and rt.gvisor_platform != "systrap":
         raise ConfigError("runtime.gvisor_platform is set but runtime.runsc is not")
     if rt.runsc is not None:
-        _check_runsc(rt.runsc)
+        rt.runsc = _check_runsc(rt.runsc)
         if rt.gpu != "none":
             raise ConfigError("runtime.runsc cannot be combined with runtime.gpu: silo does not pass GPUs "
                               "through gVisor")
