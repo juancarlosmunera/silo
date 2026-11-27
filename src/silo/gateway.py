@@ -2,8 +2,9 @@
 
     client --HTTP/127.0.0.1--> gateway --HTTP over AF_UNIX--> llama-server (network=none)
 
-The model process cannot initiate anything: it has no network interface and can only answer on its
-UNIX socket. The gateway treats both sides as untrusted and terminates the protocol rather than
+The model process cannot initiate anything: it has no network interface and can only answer on an
+abstract UNIX socket inside its own network namespace, which the gateway reaches through the
+connector (silo.connector) without any directory shared with the sandbox. The gateway treats both sides as untrusted and terminates the protocol rather than
 piping bytes:
 
   * route allowlist (OpenAI-compatible inference endpoints + /health), matched verbatim; no admin,
@@ -14,8 +15,11 @@ piping bytes:
     nosniff + a deny-all CSP, so a compromised runtime cannot serve HTML or script to a browser that
     happens to open the gateway URL;
   * no client headers reach the model, no upstream headers reach the client;
-  * loopback Host check (DNS rebinding) and no browser-originated requests (Origin);
-  * tool calling is refused unless gateway.allow_tools is set: by default the model can only emit text;
+  * loopback Host check (DNS rebinding), and browser-originated requests (Origin) only from the
+    exact origins in gateway.allowed_origins, with CORS preflight answered by the gateway itself;
+  * tool calling is refused unless gateway.allow_tools is set: by default the model can only emit text.
+    When it is set, silo.toolpolicy limits which tools a request may offer (gateway.tools) and the
+    model may only call a tool the request offered, with capped arguments;
   * size caps both ways, one total deadline per request, bounded concurrency;
   * output tripwire (silo.scanner) on every completion; in enforce mode streams are held until they
     finish clean, so a blocked completion is never partially delivered;
@@ -32,7 +36,6 @@ import ipaddress
 import json
 import os
 import socket
-import stat
 import sys
 import threading
 import time
@@ -40,7 +43,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from silo import scanner
+from silo import connector, hostrules, scanner, toolpolicy
 from silo.config import Config, ConfigError
 
 ROUTES: dict[str, set[str]] = {
@@ -52,7 +55,7 @@ ROUTES: dict[str, set[str]] = {
 }
 JSON_TYPE = "application/json"
 SSE_TYPE = "text/event-stream"
-TOOL_KEYS = ("tools", "tool_choice", "functions", "function_call", "parallel_tool_calls")
+TOOL_KEYS = toolpolicy.TOOL_KEYS
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 RESPONSE_HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
@@ -61,6 +64,8 @@ RESPONSE_HEADERS = (
     ("Referrer-Policy", "no-referrer"),
 )
 CLIENT_IO_TIMEOUT = 30  # seconds a client may stall on a single read or write
+CORS_MAX_AGE = "600"
+_TOKEN_CHARS = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyz")
 
 
 class Reject(Exception):
@@ -74,26 +79,34 @@ class ClientGone(Exception):
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, path: str, timeout: float):
+    """HTTP to the runtime over a socket obtained from `dial(timeout)` (see `runtime_dialer`)."""
+
+    def __init__(self, dial, timeout: float):
         super().__init__("localhost", timeout=timeout)
-        self._unix_path = path
+        self._dial = dial
 
     def connect(self) -> None:
-        # lstat, not stat: the path must itself be a socket, never a symlink to some other host socket.
-        try:
-            mode = os.lstat(self._unix_path).st_mode
-        except OSError as exc:
-            raise FileNotFoundError(self._unix_path) from exc
-        if not stat.S_ISSOCK(mode):
-            raise ConnectionRefusedError(f"{self._unix_path} is not a socket")
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        try:
-            sock.connect(self._unix_path)
-        except OSError:
-            sock.close()
-            raise
-        self.sock = sock
+        self.sock = self._dial(self.timeout)
+
+
+def runtime_path(cfg: Config) -> Path:
+    """The host-side socket the gateway dials: the connector's, or on gVisor the runtime's own."""
+    return cfg.gvisor_socket_path if cfg.runtime.runsc is not None else cfg.control_path
+
+
+def runtime_dialer(cfg: Config, path: Path | None = None, expect_uid: int | None | bool = True):
+    """How to reach this silo's runtime.
+
+    Normally through the connector, checking that the peer is the sandbox's UID. On gVisor the
+    runtime's socket is created on the host by gVisor's gofer, in a directory silo locks, and the
+    listening peer is that gofer, which runs as this user.
+    """
+    target = str(path or runtime_path(cfg))
+    if cfg.runtime.runsc is not None:
+        uid = os.getuid() if expect_uid is True else expect_uid
+        return lambda timeout: connector.dial_socket(target, timeout, uid)
+    uid = sandbox_uid() if expect_uid is True else expect_uid
+    return lambda timeout: connector.dial(target, timeout, uid)
 
 
 class AuditLog:
@@ -149,13 +162,17 @@ class _Server(ThreadingHTTPServer):
 
 
 class Gateway:
-    def __init__(self, cfg: Config, socket_path: Path | None = None, audit: AuditLog | None = None):
+    def __init__(self, cfg: Config, control_path: Path | None = None, audit: AuditLog | None = None,
+                 expect_uid: int | None | bool = True):
         self.cfg = cfg
         self.gw = cfg.gateway
-        self.socket_path = str(socket_path or cfg.socket_path)
+        self.control_path = str(control_path or runtime_path(cfg))
+        self.via = "gVisor" if cfg.runtime.runsc is not None else "connector"
+        self.dial = runtime_dialer(cfg, control_path, expect_uid)
         self.audit = audit or AuditLog(cfg.audit_log)
         self.slots = threading.BoundedSemaphore(self.gw.max_concurrency)
         self.loopback_only = ipaddress.ip_address(self.gw.listen).is_loopback
+        self.allowed_origins = frozenset(self.gw.allowed_origins)
         self.api_key = os.environ.get(self.gw.api_key_env) if self.gw.api_key_env else None
         if self.gw.api_key_env and not self.api_key:
             raise ConfigError(f"gateway.api_key_env={self.gw.api_key_env} is set but the variable is empty")
@@ -176,6 +193,7 @@ def _make_handler(gw: Gateway):
         _started = False
         _audited = False
         _sse = False
+        _cors: str | None = None
 
         def version_string(self) -> str:
             return "silo"
@@ -226,6 +244,9 @@ def _make_handler(gw: Gateway):
                 self.send_header("Content-Type", ctype)
                 for name, value in RESPONSE_HEADERS:
                     self.send_header(name, value)
+                if self._cors is not None:
+                    self.send_header("Access-Control-Allow-Origin", self._cors)
+                    self.send_header("Vary", "Origin")
                 if body is not None:
                     self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -267,6 +288,7 @@ def _make_handler(gw: Gateway):
 
         def _handle(self, method: str) -> None:
             self._t0, self._started, self._audited, self._sse = time.monotonic(), False, False, False
+            self._cors = None
             path = _route(self.path)
             entry = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -278,12 +300,17 @@ def _make_handler(gw: Gateway):
             }
             held = False
             try:
-                body, stream = self._admit(method, path, entry)
+                admitted = self._admit(method, path, entry)
+                if admitted is None:  # answered by the gateway itself (CORS preflight)
+                    return
+                body, stream, offered = admitted
                 if not gw.slots.acquire(timeout=5):
                     raise Reject(429, "too many concurrent requests")
                 held = True
-                self._proxy(method, path, body, stream, entry)
-            except Reject as reject:
+                callable_, max_calls = offered
+                calls = toolpolicy.CallChecker(callable_, cfg.max_tool_arguments_bytes, max_calls)
+                self._proxy(method, path, body, stream, calls, entry)
+            except (Reject, toolpolicy.ToolPolicyError) as reject:
                 self._fail(reject.status, reject.message, entry)
             except ClientGone:
                 entry.update(status=499, error="client disconnected")
@@ -302,14 +329,20 @@ def _make_handler(gw: Gateway):
                 if held:
                     gw.slots.release()
 
-        def _admit(self, method: str, path: str, entry: dict) -> tuple[bytes, bool]:
+        def _admit(self, method: str, path: str, entry: dict) -> tuple[bytes, bool, tuple] | None:
             """Every check a request must pass before anything is sent to the model."""
             if gw.loopback_only and _hostname(self.headers.get("Host", "")) not in LOOPBACK_HOSTS:
                 raise Reject(403, "Host header is not a loopback name (DNS-rebinding protection)")
-            if self.headers.get("Origin") is not None:
-                raise Reject(403, "browser-originated requests are not accepted")
+            origins = self.headers.get_all("Origin") or []
+            if origins:
+                if len(origins) != 1 or origins[0] not in gw.allowed_origins:
+                    raise Reject(403, "browser origin not allowed (gateway.allowed_origins)")
+                self._cors = entry["origin"] = origins[0]
             if path not in ROUTES:
                 raise Reject(404, "route not allowed by silo")
+            if method == "OPTIONS" and self._cors is not None:
+                self._preflight(path, entry)
+                return None
             if method not in ROUTES[path]:
                 raise Reject(405, "method not allowed")
             if gw.api_key is not None:
@@ -317,7 +350,7 @@ def _make_handler(gw: Gateway):
                 if not hmac.compare_digest(supplied.encode(), f"Bearer {gw.api_key}".encode()):
                     raise Reject(401, "missing or invalid API key")
             if method != "POST":
-                return b"", False
+                return b"", False, ([], None)
 
             if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != JSON_TYPE:
                 raise Reject(415, "Content-Type must be application/json")
@@ -347,16 +380,50 @@ def _make_handler(gw: Gateway):
                          model=model[:200] if isinstance(model, str) else None)
             if cfg.log_content:
                 entry["request"] = request
-            tool_keys = [k for k in TOOL_KEYS if k in request]
-            if tool_keys and not cfg.allow_tools:
-                raise Reject(403, f"tool calling is disabled (gateway.allow_tools = false): {', '.join(tool_keys)}")
-            return body, stream
+            offered = toolpolicy.offered_tools(request, cfg.allow_tools, cfg.tools)
+            if offered:
+                entry["tools_offered"] = offered
+            return body, stream, toolpolicy.callable_tools(request, offered)
+
+        def _preflight(self, path: str, entry: dict) -> None:
+            """Answer a CORS preflight from an allowed origin. Nothing reaches the model.
+
+            Any syntactically valid request header may be announced: the gateway forwards no client
+            header to the model, so allowing one to be sent costs nothing, and browser SDKs send their own.
+            """
+            method = self.headers.get("Access-Control-Request-Method", "")
+            if method not in ROUTES[path]:
+                raise Reject(403, "preflight for a method this route does not allow")
+            requested = [h.strip().lower() for h in self.headers.get("Access-Control-Request-Headers", "").split(",")]
+            requested = [h for h in requested if h]
+            if any(not set(h) <= _TOKEN_CHARS for h in requested):
+                raise Reject(400, "malformed Access-Control-Request-Headers")
+            entry.update(status=204, preflight=method)
+            self._audit(entry)
+            self._started = True
+            try:
+                self.send_response(204)
+                for name, value in RESPONSE_HEADERS:
+                    self.send_header(name, value)
+                self.send_header("Access-Control-Allow-Origin", self._cors)
+                self.send_header("Access-Control-Allow-Methods", method)
+                if requested:
+                    self.send_header("Access-Control-Allow-Headers", ", ".join(requested))
+                if self.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
+                    self.send_header("Access-Control-Allow-Private-Network", "true")
+                self.send_header("Access-Control-Max-Age", CORS_MAX_AGE)
+                self.send_header("Vary", "Origin")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except OSError as exc:
+                raise ClientGone from exc
 
         # --------------------------------------------------------------------------------- upstream
 
-        def _proxy(self, method: str, path: str, body: bytes, stream: bool, entry: dict) -> None:
+        def _proxy(self, method: str, path: str, body: bytes, stream: bool, calls: toolpolicy.CallChecker,
+                   entry: dict) -> None:
             deadline = self._t0 + cfg.timeout
-            conn = UnixHTTPConnection(gw.socket_path, timeout=cfg.timeout)
+            conn = UnixHTTPConnection(gw.dial, timeout=cfg.timeout)
             try:
                 headers = {"Accept": JSON_TYPE}
                 if method == "POST":
@@ -371,9 +438,9 @@ def _make_handler(gw: Gateway):
                 if ctype == SSE_TYPE:
                     if not stream or status != 200:
                         raise Reject(502, "unexpected event stream from model sandbox")
-                    self._relay_stream(resp, sock, deadline, entry)
+                    self._relay_stream(resp, sock, deadline, calls, entry)
                 elif ctype == JSON_TYPE:
-                    self._relay_json(resp, sock, status, deadline, entry)
+                    self._relay_json(resp, sock, status, deadline, calls, entry)
                 else:
                     raise Reject(502, "unexpected content type from model sandbox")
             finally:
@@ -389,7 +456,7 @@ def _make_handler(gw: Gateway):
                 pass
             return resp.read1(65536)
 
-        def _relay_json(self, resp, sock, status: int, deadline: float, entry: dict) -> None:
+        def _relay_json(self, resp, sock, status: int, deadline: float, calls, entry: dict) -> None:
             data = bytearray()
             while chunk := self._read_some(resp, sock, deadline):
                 data += chunk
@@ -409,13 +476,14 @@ def _make_handler(gw: Gateway):
                 entry["response_text"] = text
             if scanner.has_tool_calls(payload) and not cfg.allow_tools:
                 raise Reject(502, "model emitted tool calls while gateway.allow_tools = false")
+            calls.check(payload)
             if cfg.scanner == "enforce" and scanner.blocking(findings):
                 raise Reject(502, "completion blocked by silo output policy")
             entry["status"] = status
             self._audit(entry)  # the record exists before the client can act on the output
             self._send(status, JSON_TYPE, out)
 
-        def _relay_stream(self, resp, sock, deadline: float, entry: dict) -> None:
+        def _relay_stream(self, resp, sock, deadline: float, calls, entry: dict) -> None:
             hold = cfg.scanner == "enforce"  # deliver nothing until the whole completion is known clean
             stream_scan = scanner.StreamScanner()
             digest = hashlib.sha256()
@@ -462,6 +530,7 @@ def _make_handler(gw: Gateway):
                             raise Reject(502, "model sandbox sent a malformed stream event")
                         if scanner.has_tool_calls(payload) and not cfg.allow_tools:
                             raise Reject(502, "model emitted tool calls while gateway.allow_tools = false")
+                        calls.check(payload)
                         delta = scanner.extract_text(payload)
                         tools.extend(scanner.tool_call_names(payload))
                         if cfg.log_content:
@@ -487,14 +556,27 @@ def _make_handler(gw: Gateway):
     return Handler
 
 
-def serve(cfg: Config, socket_path: Path | None = None) -> None:
-    gw = Gateway(cfg, socket_path)
+def sandbox_uid() -> int:
+    try:
+        return hostrules.sandbox_host_uid(hostrules.subuid_ranges())
+    except hostrules.HostRuleError as exc:
+        raise ConfigError(f"cannot work out the sandbox's host UID: {exc}") from exc
+
+
+def tools_summary(cfg: Config) -> str:
+    if not cfg.gateway.allow_tools:
+        return "refused"
+    return f"allowed({','.join(cfg.gateway.tools)})" if cfg.gateway.tools else "allowed(any)"
+
+
+def serve(cfg: Config) -> None:
+    gw = Gateway(cfg)
     srv = gw.server()
     host, port = srv.server_address[:2]
     shown = f"[{host}]" if ":" in host else host
-    print(f"silo[{cfg.name}] gateway on http://{shown}:{port}/v1  ->  {gw.socket_path}", file=sys.stderr)
-    print(f"silo[{cfg.name}] scanner={cfg.gateway.scanner} tools={'allowed' if cfg.gateway.allow_tools else 'refused'}"
-          f" audit={gw.audit.path}", file=sys.stderr, flush=True)
+    print(f"silo[{cfg.name}] gateway on http://{shown}:{port}/v1  ->  {gw.control_path} ({gw.via})", file=sys.stderr)
+    print(f"silo[{cfg.name}] scanner={cfg.gateway.scanner} tools={tools_summary(cfg)} audit={gw.audit.path}",
+          file=sys.stderr, flush=True)
     try:
         srv.serve_forever()
     finally:

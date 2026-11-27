@@ -3,7 +3,7 @@
 # Unknown keys and wrong types are errors. Everything except [model] has a default.
 
 [silo]
-# Names the container (silo-<name>), the socket directory, the manifest and the audit log.
+# Names the container (silo-<name>), the runtime directory, the manifest and the audit log.
 name = "default"
 
 [model]
@@ -32,10 +32,22 @@ pids_limit = 256
 # runtime. Use "kill" once your model runs cleanly; it turns probing into a crash you will notice.
 seccomp_action = "errno"
 # "none" | "nvidia" | "amd" | "dri". Anything but "none" exposes a GPU driver to the sandbox and
-# keeps memfd_create allowed. Not yet verified on real hardware.
+# keeps memfd_create allowed. "dri" and "amd" pass only the render nodes (/dev/dri/renderD*), never
+# the display nodes. Verified with "dri" on an Intel GPU and llama.cpp's server-vulkan image.
 gpu = "none"
 # seccomp_base = "/usr/share/containers/seccomp.json"
 startup_timeout = 600.0
+# After the runtime has started, refuse every execve in the sandbox: the shell and tools in the image
+# become unusable to a compromised runtime. Turn it off only for an image whose entrypoint is a
+# wrapper that starts the real server. Not available with runsc.
+exec_lock = true
+# gVisor: run the sandbox on a user-space kernel, so that the runtime's system calls no longer reach
+# this machine's kernel directly. The trade: SELinux does not confine a gVisor sandbox, one directory
+# is shared with it for the runtime's socket, and inference is somewhat slower. runsc must be installed
+# outside your home directory. See docs/GVISOR.md.
+# runsc = "/usr/local/bin/runsc"
+# "systrap" works everywhere. "kvm" is faster and hands /dev/kvm to gVisor.
+# gvisor_platform = "systrap"
 
 [gateway]
 listen = "127.0.0.1"
@@ -47,6 +59,11 @@ scanner = "monitor"
 # false: requests that carry tools/functions are refused and tool calls from the model are cut off.
 # true: whatever executes those tool calls is outside the silo and becomes your boundary.
 allow_tools = false
+# With allow_tools = true: the only tool names a request may offer (empty = any). The model can only
+# call a tool the request offered, whatever this list says.
+# tools = ["read_file", "search_docs"]
+# Cap on the arguments of each tool call the model makes, in bytes.
+max_tool_arguments_bytes = 32768
 # Write prompts and completions into the audit log. Off by default: hashes and findings only.
 log_content = false
 max_request_bytes = 1048576
@@ -54,5 +71,9 @@ max_response_bytes = 16777216
 # Total seconds per request, from connect to last byte.
 timeout = 600.0
 max_concurrency = 4
+# Browser-based clients: the exact origins (scheme://host[:port], as the browser sends them) allowed to
+# call the gateway. Requests from any other page are refused. Any script on a listed page can use the
+# model, so set api_key_env as well.
+# allowed_origins = ["http://localhost:3000"]
 # Required for a non-loopback listen address: name of an environment variable holding a bearer token.
 # api_key_env = "SILO_API_KEY"

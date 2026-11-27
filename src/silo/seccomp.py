@@ -15,11 +15,17 @@ compromised, so:
     bpf, perf_event_open, userfaultfd, keyrings, mount API, ptrace, process_vm_*, pidfd_getfd ...
   * none of the standard kernel-exploitation primitives an inference server has no use for:
     SysV/POSIX message queues (msg_msg spraying), splice/vmsplice/tee, legacy AIO, remap_file_pages.
+  * on CPU-only sandboxes, ioctl, prctl and setsockopt are limited to argument values an inference
+    server uses (measured on llama-server, see ARG_ALLOWLISTS): no driver ioctls, no socket filters.
 
 libseccomp detail this module depends on: an unconditional rule for a syscall silently wins over any
 argument-filtered rule for the same syscall, whatever the action or order. So a syscall that needs
 argument filtering must first be removed from the base profile entirely (REPLACED) and re-added with
 conditions that are disjoint and exhaustive.
+
+Portability rule this module keeps: no rule compares the same argument twice. gVisor, which also
+enforces this profile when it is the sandbox's kernel, keeps one comparison per argument and drops
+the rest without an error (see _complement).
 """
 
 from __future__ import annotations
@@ -129,6 +135,8 @@ DENY: dict[str, str] = {
     "splice": "page-cache/pipe splicing (Dirty Pipe class)",
     "tee": "pipe buffer duplication (Dirty Pipe class)",
     "remap_file_pages": "deprecated nonlinear mappings",
+    "sendfile": "into a pipe it shares page-cache pages as splice does (Dirty Pipe class)",
+    "seccomp": "loads classic BPF programs into the kernel; prctl(PR_SET_SECCOMP) is refused already",
     "io_setup": "legacy AIO: unneeded, recurring use-after-free source",
     "io_destroy": "legacy AIO",
     "io_submit": "legacy AIO",
@@ -149,8 +157,49 @@ CPU_ONLY_DENY: dict[str, str] = {
     "memfd_create": "fileless execution of dropped binaries",
 }
 
+# Argument allowlists, applied on CPU-only sandboxes (GPU userspace drivers issue device ioctls that
+# cannot be enumerated here). Each maps an argument index to the values allowed; everything else is
+# denied. The values are what llama-server and the probe runner (CPython) were measured using under
+# strace, on x86_64 and on aarch64, plus a few read-only or self-directed operations that runtimes
+# commonly issue. Numbers are the asm-generic ones, identical on both architectures.
+IOCTL_ALLOW: dict[int, str] = {
+    0x5401: "TCGETS: isatty() and terminal checks (ENOTTY on anything that is not a tty)",
+    0x802C542A: "TCGETS2: isatty() in newer glibc",
+    0x5413: "TIOCGWINSZ: terminal size queries",
+    0x541B: "FIONREAD: bytes waiting on a socket or pipe",
+    0x5421: "FIONBIO: non-blocking mode, handled generically in fs/ioctl.c",
+    0x5450: "FIONCLEX: close-on-exec off, generic",
+    0x5451: "FIOCLEX: close-on-exec on, generic (CPython's set_inheritable)",
+}
+PRCTL_ALLOW: dict[int, str] = {
+    # crun runs these after loading the filter, while it drops capabilities before exec. Both only
+    # shed privilege: the bounding set can only shrink, and KEEPCAPS matters for setuid transitions,
+    # which no_new_privs and the empty capability set already rule out.
+    24: "PR_CAPBSET_DROP (crun)", 8: "PR_SET_KEEPCAPS (crun)",
+    1: "PR_SET_PDEATHSIG", 2: "PR_GET_PDEATHSIG", 3: "PR_GET_DUMPABLE",
+    15: "PR_SET_NAME: thread names", 16: "PR_GET_NAME",
+    21: "PR_GET_SECCOMP", 23: "PR_CAPBSET_READ", 30: "PR_GET_TIMERSLACK", 37: "PR_GET_CHILD_SUBREAPER",
+    38: "PR_SET_NO_NEW_PRIVS (can only tighten)", 39: "PR_GET_NO_NEW_PRIVS", 42: "PR_GET_THP_DISABLE",
+    51: "PR_SVE_GET_VL: aarch64 only, reads the SVE vector length (llama-server, to pick its code path)",
+    52: "PR_GET_SPECULATION_CTRL",
+}
+SOL_SOCKET, IPPROTO_TCP = 1, 6
+SETSOCKOPT_ALLOW: dict[int, dict[int, str]] = {
+    SOL_SOCKET: {
+        2: "SO_REUSEADDR (llama-server's listener)", 7: "SO_SNDBUF", 8: "SO_RCVBUF", 9: "SO_KEEPALIVE",
+        13: "SO_LINGER", 20: "SO_RCVTIMEO_OLD (llama-server)", 21: "SO_SNDTIMEO_OLD (llama-server)",
+        66: "SO_RCVTIMEO_NEW", 67: "SO_SNDTIMEO_NEW",
+    },
+    IPPROTO_TCP: {1: "TCP_NODELAY (llama-server sets it; on AF_UNIX the kernel answers EOPNOTSUPP)"},
+}
+ARG_FILTERED = {"ioctl", "prctl", "setsockopt"}
+
 # Removed from the base profile and re-added below with silo's own argument conditions.
 REPLACED = {"socket", "socketpair", "clone"}
+
+# With the exec lock (silo.execlock) these are neither allowed nor denied by the filter: the kernel
+# suspends the caller and asks silo's supervisor, which lets the container's first one through.
+EXEC_SYSCALLS = ("execve", "execveat")
 
 
 def _deny(action: str, errno: int) -> dict:
@@ -163,8 +212,75 @@ def _arg(index: int, value: int, op: str, value_two: int = 0) -> dict:
     return {"index": index, "value": value, "valueTwo": value_two, "op": op}
 
 
-def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_only: bool = True) -> dict:
-    """Return a hardened copy of an OCI/containers seccomp profile."""
+U32 = 0xFFFFFFFF
+
+
+def _complement(index: int, values) -> list[list[dict]]:
+    """Conditions that together match every 64-bit value of one argument except `values`.
+
+    Each is a single comparison, so that a rule never compares the same argument twice. That matters
+    beyond style: libseccomp evaluates both comparisons of a range like `> a AND < b`, but gVisor's
+    conversion of an OCI profile keeps one comparison per argument and silently drops the other,
+    which turns such a deny rule into `< b` and kills calls that are on the allowlist. libseccomp 2.6
+    also refuses (EEXIST) several range rules behind a shared condition on another argument.
+
+    So the complement is written as aligned bit-prefix blocks of the low 32 bits (masked equality,
+    like the CIDR blocks that cover every address but a few), plus one rule for any value with upper
+    bits set. Together with the equality rules for `values` they are disjoint and exhaustive.
+    """
+    vals = sorted(set(values))
+    if any(v > U32 for v in vals):
+        raise ValueError("allowlists cover 32-bit values")
+    if len(vals) == 1:
+        return [[_arg(index, vals[0], "SCMP_CMP_NE")]]
+    out = [[_arg(index, U32, "SCMP_CMP_GT")]]
+
+    def walk(depth: int, prefix: int, members: list[int]) -> None:
+        if not members:
+            mask = (((1 << depth) - 1) << (32 - depth)) | (U32 << 32)
+            out.append([_arg(index, mask, "SCMP_CMP_MASKED_EQ", prefix)])
+            return
+        if depth == 32:
+            return
+        bit = 31 - depth
+        walk(depth + 1, prefix, [v for v in members if not v >> bit & 1])
+        walk(depth + 1, prefix | 1 << bit, [v for v in members if v >> bit & 1])
+
+    walk(0, 0, vals)
+    return out
+
+
+def _allowlist_rules(name: str, index: int, values, deny: dict, prefix: tuple = (), label: str = "") -> list[dict]:
+    """Allow rules for `values` of one argument, then deny rules for everything else."""
+    allow = [{"names": [name], "action": "SCMP_ACT_ALLOW", "args": [*prefix, _arg(index, v, "SCMP_CMP_EQ")],
+              "comment": f"silo: {name}{label} allowlist"} for v in sorted(values)]
+    denied = [{"names": [name], **deny, "args": [*prefix, *condition],
+               "comment": f"silo: {name}{label} not allowlisted"} for condition in _complement(index, values)]
+    return allow + denied
+
+
+def argument_rules(action: str) -> list[dict]:
+    """The ioctl / prctl / setsockopt rules for a CPU-only sandbox."""
+    deny = _deny(action, EPERM)
+    rules = _allowlist_rules("ioctl", 1, IOCTL_ALLOW, deny)
+    rules += _allowlist_rules("prctl", 0, PRCTL_ALLOW, deny)
+    # Allow rules come before deny rules for each syscall. With disjoint rules the order means nothing,
+    # but an engine that evaluated them first-match would then at worst allow what is allowlisted.
+    for level, names in SETSOCKOPT_ALLOW.items():
+        rules += _allowlist_rules("setsockopt", 2, names, deny, prefix=(_arg(1, level, "SCMP_CMP_EQ"),),
+                                  label=f" level {level}")
+    rules += [{"names": ["setsockopt"], **deny, "args": condition, "comment": "silo: setsockopt level not allowlisted"}
+              for condition in _complement(1, SETSOCKOPT_ALLOW)]
+    return rules
+
+
+def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_only: bool = True,
+           exec_listener: Path | None = None) -> dict:
+    """Return a hardened copy of an OCI/containers seccomp profile.
+
+    With `exec_listener` (the socket silo's exec supervisor listens on), execve and execveat are
+    decided by that supervisor instead of being allowed.
+    """
     if action not in ("errno", "kill"):
         raise ValueError("action must be 'errno' or 'kill'")
     machine = machine or platform.machine()
@@ -181,7 +297,8 @@ def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_on
     profile["defaultErrnoRet"] = ENOSYS
 
     deny = dict(DENY, **(CPU_ONLY_DENY if cpu_only else {}))
-    strip = set(deny) | set(FORCE_ENOSYS) | REPLACED
+    strip = (set(deny) | set(FORCE_ENOSYS) | REPLACED | (ARG_FILTERED if cpu_only else set())
+             | (set(EXEC_SYSCALLS) if exec_listener else set()))
     rules = []
     for rule in profile.get("syscalls", []):
         names = [n for n in rule.get("names", []) if n not in strip]
@@ -216,6 +333,8 @@ def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_on
             "args": [_arg(0, bit, "SCMP_CMP_MASKED_EQ", bit)],
             "comment": f"silo: clone with {flag_name}",
         })
+    if cpu_only:
+        rules.extend(argument_rules(action))
     rules.append({
         "names": sorted(deny),
         **_deny(action, EPERM),
@@ -227,6 +346,15 @@ def harden(base: dict, machine: str | None = None, action: str = "errno", cpu_on
         "errnoRet": ENOSYS,
         "comment": "silo: force libc fallback to filterable syscalls",
     })
+    profile.pop("listenerPath", None)
+    profile.pop("listenerMetadata", None)
+    if exec_listener:
+        rules.append({
+            "names": list(EXEC_SYSCALLS),
+            "action": "SCMP_ACT_NOTIFY",
+            "comment": "silo: exec lock, decided by the supervisor (first exec of the container only)",
+        })
+        profile["listenerPath"] = str(exec_listener)
     profile["syscalls"] = rules
     return profile
 
@@ -243,9 +371,10 @@ def allowed_unconditionally(profile: dict) -> set[str]:
     return out
 
 
-def write_profile(base_path: Path, out_path: Path, action: str = "errno", cpu_only: bool = True) -> Path:
+def write_profile(base_path: Path, out_path: Path, action: str = "errno", cpu_only: bool = True,
+                  exec_listener: Path | None = None) -> Path:
     base = json.loads(base_path.read_text())
-    profile = harden(base, action=action, cpu_only=cpu_only)
+    profile = harden(base, action=action, cpu_only=cpu_only, exec_listener=exec_listener)
     out_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = out_path.with_suffix(".tmp")
     tmp.write_text(json.dumps(profile, indent=2) + "\n")

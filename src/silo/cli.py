@@ -58,7 +58,9 @@ def cmd_doctor(cfg: Config, args) -> int:
 
 def cmd_seccomp(cfg: Config, args) -> int:
     base = json.loads(cfg.runtime.seccomp_base.read_text())
-    profile = seccomp.harden(base, action=cfg.runtime.seccomp_action, cpu_only=cfg.runtime.gpu == "none")
+    locked = runtime.exec_lock(cfg)
+    profile = seccomp.harden(base, action=cfg.runtime.seccomp_action, cpu_only=cfg.runtime.gpu == "none",
+                             exec_listener=cfg.socket_dir / runtime.EXEC_SOCKET if locked else None)
     if args.out:
         Path(args.out).write_text(json.dumps(profile, indent=2) + "\n")
         print(f"wrote {args.out}")
@@ -71,6 +73,16 @@ def cmd_seccomp(cfg: Config, args) -> int:
     print(f"unconditionally allowed: {len(before)} -> {len(after)} syscalls")
     print(f"removed from the stock allowlist ({len(removed)}): {', '.join(removed)}")
     print("socket()/socketpair(): AF_UNIX only · clone(): no namespace flags · clone3(): ENOSYS")
+    if locked:
+        print("execve()/execveat(): decided by silo's exec supervisor, which lets the container's first one through")
+    else:
+        why = "gVisor has no seccomp user notification" if runtime.gvisor(cfg) else "runtime.exec_lock = false"
+        print(f"execve()/execveat(): allowed ({why})")
+    if cfg.runtime.gpu == "none":
+        print(f"argument allowlists: ioctl ({len(seccomp.IOCTL_ALLOW)} requests), prctl ({len(seccomp.PRCTL_ALLOW)} "
+              f"options), setsockopt ({sum(map(len, seccomp.SETSOCKOPT_ALLOW.values()))} options)")
+    else:
+        print("argument allowlists: off (GPU passthrough needs device ioctls)")
     print(f"deny action: {cfg.runtime.seccomp_action}")
     return 0
 
@@ -145,7 +157,12 @@ def cmd_up(cfg: Config, args) -> int:
     _announce(cfg)
     _note(f"silo[{cfg.name}] starting {cfg.container_name} from {cfg.runtime.image}")
     runtime.up(cfg, verify=not args.no_verify, full_verify=args.full_verify)
-    _note(f"silo[{cfg.name}] model healthy on {cfg.socket_path} (socket directory locked)")
+    if runtime.gvisor(cfg):
+        _note(f"silo[{cfg.name}] model healthy on gVisor ({cfg.runtime.gvisor_platform}), reached through "
+              f"{cfg.gvisor_socket_path} (socket directory locked)")
+    else:
+        _note(f"silo[{cfg.name}] model healthy, reached through {cfg.control_path} (connector; no shared directory; "
+              f"exec lock {'on' if runtime.exec_lock(cfg) else 'off'})")
     if args.detach:
         return 0
     try:
@@ -160,8 +177,8 @@ def cmd_up(cfg: Config, args) -> int:
 
 def cmd_gateway(cfg: Config, args) -> int:
     _announce(cfg)
-    if not runtime.socket_dir_locked(cfg):
-        raise runtime.LaunchError(f"{cfg.socket_dir} is missing or not locked; start the sandbox with "
+    if not runtime.runtime_reachable(cfg):
+        raise runtime.LaunchError(f"no running sandbox behind {gateway.runtime_path(cfg)}; start it with "
                                   "`silo up --detach` first")
     try:
         gateway.serve(cfg)

@@ -16,12 +16,30 @@ import time
 from pathlib import Path
 
 from silo import intake, sandbox, seccomp
-from silo.config import Config, ConfigError, runtime_root
-from silo.gateway import UnixHTTPConnection
+from silo.config import Config, ConfigError, memory_bytes, runtime_root
+from silo.gateway import UnixHTTPConnection, runtime_dialer, runtime_path
 from silo.util import safe_text
 
-SOCKET_NAME = "llama.sock"
-SOCKET_IN_CONTAINER = f"/run/silo/{SOCKET_NAME}"
+# llama-server listens on this abstract UNIX socket: it exists only in the sandbox's own network
+# namespace, so no host directory is shared (see silo.connector).
+ABSTRACT_SOCKET = "silo-llama.sock"
+CONNECTOR_START_TIMEOUT = 15.0
+# The exec supervisor's files, in the sandbox's runtime directory (or a probe run's own).
+EXEC_SOCKET, EXEC_PIDFILE, EXEC_LOG = "exec.sock", "execlock.pid", "execlock.log"
+# On gVisor (runtime.runsc) abstract sockets live inside gVisor's own kernel, where the connector
+# cannot reach them. There the runtime binds a socket in a mounted directory instead, which gVisor
+# creates on the host (host-uds=create) and which silo locks as soon as the socket appears.
+GVISOR_SOCKET_DIR_IN_CONTAINER = "/run/silo"
+# The scope's task limit covers gVisor's own threads too: each sandboxed thread has a host thread
+# behind it, and the sentry and gofer need their own.
+GVISOR_TASK_HEADROOM = 512
+SIGKILL_EXIT = 128 + 9
+# Seconds the runtime gets to exit by itself before it is killed. On gVisor llama-server never gets
+# there: its HTTP library stops the accept loop with shutdown() on the listening socket, which
+# wakes accept() on Linux but, on gVisor, fails with ENOTCONN and leaves accept() blocked. The
+# sandbox holds no state, so it is given a short grace period and then killed.
+STOP_GRACE = 10
+GVISOR_STOP_GRACE = 2
 
 # llama-server flags that would hand the runtime network access, tools, a shell, other models or
 # host-facing endpoints. The sandbox contains all of them anyway (no network, read-only root); the
@@ -32,6 +50,7 @@ FORBIDDEN_SERVER_WORDS = frozenset({
     "tool", "tools", "agent", "mcp", "proxy", "rpc",           # tools, agents, remote backends
     "host", "port", "ssl", "api", "ui", "webui",               # listeners and web UI
     "props", "slot", "slots", "metrics", "media", "models",    # admin/state endpoints, router mode
+    "connect",                                                 # llama-connect peer-to-peer tunnel
 })
 FORBIDDEN_SERVER_FLAGS = frozenset({
     "-m", "--model", "--path", "--log-prompts-dir", "--video-ffmpeg-dir",
@@ -47,18 +66,46 @@ class LaunchError(RuntimeError):
     pass
 
 
+def run_detached(cmd: list[str]) -> tuple[int, str]:
+    """Run a command that leaves processes behind (podman run --detach), without pipes.
+
+    Under gVisor the sandbox process inherits the launcher's stdout and stderr; a captured pipe would
+    then never reach EOF. Output goes to an unnamed temporary file instead.
+    """
+    with tempfile.TemporaryFile() as err:
+        code = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err).returncode
+        err.seek(0)
+        return code, err.read().decode("utf-8", "replace")
+
+
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=check, text=True, capture_output=True, errors="replace")
 
 
 # ------------------------------------------------------------------------------------ llama-server
 
+def physical_cores(sysfs: Path = Path("/sys/devices/system/cpu")) -> int | None:
+    """Physical cores this process may run on, from the kernel's CPU topology; None if unknown."""
+    cores = set()
+    try:
+        for cpu in os.sched_getaffinity(0):
+            topology = sysfs / f"cpu{cpu}" / "topology"
+            cores.add((topology.joinpath("physical_package_id").read_text().strip(),
+                       topology.joinpath("core_id").read_text().strip()))
+    except OSError:
+        return None
+    return len(cores) or None
+
+
 def check_extra_args(extra: list[str]) -> None:
     for arg in extra:
         if not arg.startswith("-"):
             continue
+        # llama.cpp reads `--mcp_servers_json` as `--mcp-servers-json`: compare the same way
         flag = arg.split("=", 1)[0]
-        words = set(flag.lstrip("-").lower().split("-"))
+        if flag.startswith("--"):
+            flag = flag.replace("_", "-").lower()
+        words = set(flag.lstrip("-").split("-"))
         if flag in FORBIDDEN_SERVER_FLAGS or (flag.startswith("--") and words & FORBIDDEN_SERVER_WORDS):
             raise ConfigError(f"model.extra_args: {flag} is not allowed inside a silo")
 
@@ -66,20 +113,38 @@ def check_extra_args(extra: list[str]) -> None:
 def server_command(cfg: Config) -> list[str]:
     _, model_file = cfg.require_model()
     check_extra_args(cfg.model.extra_args)
-    cmd = ["--model", f"/models/{model_file}", "--host", SOCKET_IN_CONTAINER,
+    host = (f"{GVISOR_SOCKET_DIR_IN_CONTAINER}/{cfg.gvisor_socket_path.name}" if gvisor(cfg)
+            else f"@{ABSTRACT_SOCKET}")
+    cmd = ["--model", f"/models/{model_file}", "--host", host,
            "--ctx-size", str(cfg.model.ctx_size), *SAFETY_SWITCHES]
-    if cfg.model.threads:
-        cmd += ["--threads", str(cfg.model.threads)]
+    threads = cfg.model.threads
+    if threads is None and gvisor(cfg):
+        # llama.cpp starts one thread per physical core, which it reads from the CPU topology in
+        # sysfs. gVisor does not show the host's topology, so llama.cpp would start one per logical
+        # CPU instead, which on a hyperthreaded machine costs about a third of the throughput.
+        threads = physical_cores()
+    if threads:
+        cmd += ["--threads", str(threads)]
     return cmd + list(cfg.model.extra_args)
 
 
 # --------------------------------------------------------------------------------------- host prep
 
-def prepare_seccomp(cfg: Config) -> Path:
+def exec_lock(cfg: Config) -> bool:
+    """Whether execve is decided by silo's supervisor (silo.execlock) for this sandbox.
+
+    Not on gVisor: its seccomp implementation has no user notification and refuses such a profile.
+    """
+    return cfg.runtime.exec_lock and not gvisor(cfg)
+
+
+def prepare_seccomp(cfg: Config, exec_dir: Path | None = None, probe: bool = False) -> Path:
+    """Write the hardened profile. `exec_dir` is where this sandbox's exec supervisor listens."""
     if not cfg.runtime.seccomp_base.is_file():
         raise LaunchError(f"base seccomp profile not found: {cfg.runtime.seccomp_base} (install containers-common)")
-    return seccomp.write_profile(cfg.runtime.seccomp_base, cfg.seccomp_path, action=cfg.runtime.seccomp_action,
-                                 cpu_only=cfg.runtime.gpu == "none")
+    return seccomp.write_profile(cfg.runtime.seccomp_base, cfg.probe_seccomp_path if probe else cfg.seccomp_path,
+                                 action=cfg.runtime.seccomp_action, cpu_only=cfg.runtime.gpu == "none",
+                                 exec_listener=exec_dir / EXEC_SOCKET if exec_dir else None)
 
 
 def require_image(image: str) -> None:
@@ -90,12 +155,12 @@ def require_image(image: str) -> None:
 def _private_root() -> Path:
     root = runtime_root()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(root, 0o700)  # host-side gate: only this user can reach anything silo shares with a sandbox
+    os.chmod(root, 0o700)  # only this user can reach the connector's control socket
     return root
 
 
 def _remove_dir(path: Path) -> None:
-    """Delete a directory a sandbox may have written to (entries can belong to its subordinate UID)."""
+    """Delete a silo runtime directory (entries the connector made can belong to a subordinate UID)."""
     if path.parent != runtime_root():
         raise LaunchError(f"refusing to delete {path}: not a silo runtime directory")
     if path.is_symlink():
@@ -103,23 +168,69 @@ def _remove_dir(path: Path) -> None:
         return
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
-    if path.exists():  # something inside is owned by the sandbox UID; remove it from inside the userns
+    if path.exists():
         run(["podman", "unshare", "rm", "-rf", "--", str(path)], check=False)
     if path.exists():
         raise LaunchError(f"cannot clean up {path}")
 
 
-def prepare_socket_dir(cfg: Config) -> Path:
-    """Create the one host directory the model sandbox can write to, empty and private.
-
-    It has to be writable by the sandbox UID until llama-server has bound its socket; `lock_socket_dir`
-    then takes that away again. The 0700 parent keeps every other host user out throughout.
-    """
+def prepare_run_dir(cfg: Config) -> Path:
+    """The host-side directory for the connector's control socket. Never mounted into a sandbox."""
     _private_root()
     _remove_dir(cfg.socket_dir)
     cfg.socket_dir.mkdir(mode=0o700)
-    os.chmod(cfg.socket_dir, 0o777)
     return cfg.socket_dir
+
+
+def gvisor(cfg: Config) -> bool:
+    return cfg.runtime.runsc is not None
+
+
+def scoped(cfg: Config, args: list[str], memory: str | None = None) -> list[str]:
+    """On gVisor, run podman inside a systemd user scope that carries the resource limits.
+
+    Rootless runsc cannot configure cgroups, so podman's --memory, --pids-limit and --cpus would be
+    silently without effect. Refusing to start is better than starting unlimited.
+    """
+    if not gvisor(cfg):
+        return args
+    if not shutil.which("systemd-run"):
+        raise LaunchError("runtime.runsc needs systemd-run: under gVisor the memory and task limits are "
+                          "enforced by a systemd user scope")
+    tasks = 2 * cfg.runtime.pids_limit + GVISOR_TASK_HEADROOM
+    return sandbox.gvisor_scope(memory_bytes(memory or cfg.runtime.memory), tasks, cfg.runtime.cpus) + args
+
+
+class GvisorSocketLock(threading.Thread):
+    """Locks the gVisor socket directory the moment anything appears in it, then checks it."""
+
+    INTERVAL = 0.002
+
+    def __init__(self, cfg: Config, deadline: float):
+        super().__init__(daemon=True, name="silo-gvisor-socket-lock")
+        self.directory, self.deadline = cfg.gvisor_socket_dir, deadline
+        self.socket_name = cfg.gvisor_socket_path.name
+        self.locked = threading.Event()
+        self.error: LaunchError | None = None
+
+    def run(self) -> None:
+        while time.monotonic() < self.deadline:
+            try:
+                entries = os.listdir(self.directory)
+            except OSError:
+                entries = []
+            if entries:
+                # The directory belongs to this user, container root inside the sandbox. Once it is 0755
+                # the runtime (nobody) can no longer add, rename or remove entries: gVisor's own
+                # permission checks refuse it, and its gofer re-reads the mode from the host.
+                os.chmod(self.directory, 0o755)
+                entries = sorted(os.listdir(self.directory))
+                if entries != [self.socket_name] or not _is_socket(self.directory / self.socket_name):
+                    self.error = LaunchError(f"unexpected content in the socket directory "
+                                             f"({[safe_text(e) for e in entries]}); refusing to connect")
+                self.locked.set()
+                return
+            time.sleep(self.INTERVAL)
 
 
 def _is_socket(path: Path) -> bool:
@@ -129,70 +240,115 @@ def _is_socket(path: Path) -> bool:
         return False
 
 
-def lock_socket_dir(cfg: Config) -> None:
-    """Freeze the shared directory once the runtime's socket exists.
+# --------------------------------------------------------------------------------------- connector
 
-    After this the sandbox (which is "other" for a directory owned by the host user) can no longer
-    create, rename or delete entries: it cannot fill the host's runtime tmpfs and cannot replace the
-    socket with a symlink to another host socket. The content check runs after the chmod, so what it
-    sees is final.
-    """
-    os.chmod(cfg.socket_dir, 0o755)
-    entries = sorted(os.listdir(cfg.socket_dir))
-    if entries != [SOCKET_NAME] or not _is_socket(cfg.socket_path):
-        raise LaunchError(f"unexpected content in the socket directory ({[safe_text(e) for e in entries]}); "
-                          "the sandbox did something other than bind its socket. Refusing to connect.")
+def connector_script() -> str:
+    return importlib.resources.files("silo").joinpath("connector.py").read_text()
 
 
-class SocketDirWatcher(threading.Thread):
-    """Locks the socket directory the moment anything appears in it.
-
-    llama-server binds its socket and goes straight on to read the model file, so the lock cannot
-    land before model loading starts; it can only land close behind the bind. This thread is started
-    before the container and does nothing but watch, so nothing else silo is doing (podman calls take
-    tens of milliseconds) delays it. Whatever a load-time exploit left in the directory in the
-    meantime fails the content check in `lock_socket_dir`, and the launch with it.
-    """
-
-    INTERVAL = 0.0005
-
-    def __init__(self, cfg: Config, deadline: float):
-        super().__init__(daemon=True, name="silo-socket-lock")
-        self.cfg, self.deadline = cfg, deadline
-        self.locked = threading.Event()
-        self.error: LaunchError | None = None
-        self._cancelled = threading.Event()
-
-    def cancel(self) -> None:
-        self._cancelled.set()
-
-    def run(self) -> None:
-        directory = self.cfg.socket_dir
-        while not self._cancelled.is_set() and time.monotonic() < self.deadline:
-            try:
-                with os.scandir(directory) as it:
-                    empty = next(it, None) is None
-            except OSError:
-                empty = True
-            if not empty:
-                try:
-                    lock_socket_dir(self.cfg)
-                except LaunchError as exc:
-                    self.error = exc
-                except OSError as exc:
-                    self.error = LaunchError(f"cannot lock {directory}: {exc.strerror}")
-                self.locked.set()
-                return
-            time.sleep(self.INTERVAL)
+def container_pid(name: str) -> int:
+    res = run(["podman", "container", "inspect", "--format", "{{.State.Pid}}", name], check=False)
+    pid = res.stdout.strip()
+    if res.returncode != 0 or not pid.isdigit() or int(pid) <= 1:
+        raise LaunchError(f"cannot find the process of {name}")
+    return int(pid)
 
 
-def socket_dir_locked(cfg: Config) -> bool:
+def connector_pid(cfg: Config) -> int | None:
+    return _helper_pid(cfg.connector_pidfile)
+
+
+def _start_helper(what: str, source: str, args: list[str], log_path: Path, socket_path: Path) -> None:
+    """Start one of silo's helpers under `podman unshare`, from source text, and wait until it listens."""
+    log = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        st = os.lstat(cfg.socket_dir)
+        proc = subprocess.Popen(["podman", "unshare", sys.executable, "-I", "-", *args],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
+    finally:
+        os.close(log)
+    proc.stdin.write(source.encode())
+    proc.stdin.close()
+    deadline = time.monotonic() + CONNECTOR_START_TIMEOUT
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        if _is_socket(socket_path) and "ready" in _read_log(log_path):
+            return
+        time.sleep(0.05)
+    raise LaunchError(f"{what} did not start:\n{_read_log(log_path)[-800:]}")
+
+
+def _helper_pid(pidfile: Path) -> int | None:
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 1:
+        return None
+    # A pidfile outlives its process (a crash, a reboot) and PIDs are reused, by the sandbox too, which
+    # can burn through them quickly. Only a process started with this very pidfile is ours.
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
-        return False
-    return (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
-            and _is_socket(cfg.socket_path))
+        return None
+    return pid if os.fsencode(str(pidfile)) in argv else None
+
+
+def _stop_helper(pidfile: Path) -> None:
+    pid = _helper_pid(pidfile)
+    if pid is None:
+        return
+    deadline = time.monotonic() + 3  # helpers exit by themselves once the sandbox's processes are gone
+    while time.monotonic() < deadline and _helper_pid(pidfile) == pid:
+        time.sleep(0.1)
+    if _helper_pid(pidfile) == pid:  # they may run as a subordinate UID: signal from inside the namespace
+        run(["podman", "unshare", "kill", "-KILL", str(pid)], check=False)
+
+
+def _read_log(path: Path) -> str:
+    try:
+        return safe_text(path.read_text(errors="replace"))
+    except OSError:
+        return ""
+
+
+def start_connector(cfg: Config, pid: int) -> None:
+    """Start the connector for the sandbox whose process is `pid` and wait until it serves."""
+    _start_helper("connector", connector_script(),
+                  ["--pid", str(pid), "--address", ABSTRACT_SOCKET, "--control", str(cfg.control_path),
+                   "--pidfile", str(cfg.connector_pidfile)], cfg.connector_log, cfg.control_path)
+
+
+def stop_connector(cfg: Config) -> None:
+    _stop_helper(cfg.connector_pidfile)
+
+
+# ----------------------------------------------------------------------------------- exec lock
+
+def execlock_script() -> str:
+    return importlib.resources.files("silo").joinpath("execlock.py").read_text()
+
+
+def start_exec_supervisor(cfg: Config, directory: Path) -> None:
+    """Start the exec supervisor for a sandbox whose seccomp profile names `directory`'s socket.
+
+    It has to listen before the container is created: the runtime hands it the notification
+    descriptor while it sets the container up, and refuses to start the container if nobody answers.
+    """
+    cfg.audit_log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    args = ["--listen", str(directory / EXEC_SOCKET), "--pidfile", str(directory / EXEC_PIDFILE),
+            "--audit", str(cfg.audit_log), "--name", cfg.name]
+    if cfg.runtime.seccomp_action == "kill":
+        args.append("--kill")
+    _start_helper("exec supervisor", execlock_script(), args, directory / EXEC_LOG, directory / EXEC_SOCKET)
+
+
+def execs_refused(directory: Path) -> int:
+    """How many execve calls this sandbox's supervisor has refused so far."""
+    # Lines carry the running number of the execve (the allowed first one included); after the first
+    # hundred refusals the supervisor records only a sample, so the last number is the count.
+    numbers = re.findall(r"^execlock: execve #(\d+) ", _read_log(directory / EXEC_LOG), re.M)
+    return int(numbers[-1]) - 1 if numbers else 0
 
 
 # --------------------------------------------------------------------------------------- lifecycle
@@ -202,15 +358,17 @@ def container_running(name: str) -> bool:
     return res.returncode == 0 and res.stdout.strip() == "true"
 
 
-def health(socket_path: Path, timeout: float = 5) -> int | None:
-    conn = UnixHTTPConnection(str(socket_path), timeout=timeout)
+def health(cfg: Config, timeout: float = 5) -> int | None:
+    conn = None
     try:
+        conn = UnixHTTPConnection(runtime_dialer(cfg), timeout=timeout)
         conn.request("GET", "/health")
         return conn.getresponse().status
     except Exception:  # noqa: BLE001 - a hostile runtime may answer with anything; that is "not healthy"
         return None
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def _tail_logs(name: str, lines: int = 30) -> str:
@@ -218,7 +376,8 @@ def _tail_logs(name: str, lines: int = 30) -> str:
     return safe_text((res.stdout + res.stderr).strip())
 
 
-def _exit_hint(name: str) -> str:
+def _exit_hint(cfg: Config) -> str:
+    name = cfg.container_name
     res = run(["podman", "container", "inspect", "--format", "{{.State.ExitCode}} {{.State.OOMKilled}}", name],
               check=False)
     code, _, oom = res.stdout.strip().partition(" ")
@@ -227,6 +386,15 @@ def _exit_hint(name: str) -> str:
     if code == str(SIGSYS_EXIT):
         return ("killed by seccomp (SIGSYS): the runtime used a syscall the profile denies. "
                 'Set runtime.seccomp_action = "errno" to keep it running and find out which')
+    if code == str(SIGKILL_EXIT) and exec_lock(cfg) and execs_refused(cfg.socket_dir):
+        return ("killed by silo's exec lock: the runtime tried to execute another program. If the image's "
+                "entrypoint is a wrapper that starts the real server, set runtime.exec_lock = false")
+    if exec_lock(cfg) and execs_refused(cfg.socket_dir):
+        return (f"exit code {code or 'unknown'}, after silo's exec lock refused an execve. If the image's "
+                "entrypoint is a wrapper that starts the real server, set runtime.exec_lock = false")
+    if code == str(SIGKILL_EXIT) and gvisor(cfg):
+        return ("killed (SIGKILL): under gVisor that is what running out of runtime.memory looks like, "
+                "because the limit covers the whole gVisor sandbox")
     return f"exit code {code or 'unknown'}"
 
 
@@ -247,51 +415,67 @@ def up(cfg: Config, verify: bool = True, full_verify: bool = False) -> None:
             shown = "\n  ".join(safe_text(p) for p in problems[:20])
             raise LaunchError(f"model directory does not match its manifest:\n  {shown}")
     require_image(cfg.runtime.image)
-    profile = prepare_seccomp(cfg)
-    prepare_socket_dir(cfg)
+    prepare_run_dir(cfg)
+    profile = prepare_seccomp(cfg, exec_dir=cfg.socket_dir if exec_lock(cfg) else None)
+    mounts = [sandbox.Mount(models_dir, "/models", shared_label=True)]
+    if gvisor(cfg):
+        cfg.gvisor_socket_dir.mkdir(mode=0o700)
+        os.chmod(cfg.gvisor_socket_dir, 0o777)  # until the runtime has bound its socket; then locked
+        mounts.append(sandbox.Mount(cfg.gvisor_socket_dir, GVISOR_SOCKET_DIR_IN_CONTAINER, writable=True))
     args = sandbox.podman_run_args(
         cfg,
         name=cfg.container_name,
         image=cfg.runtime.image,
         command=server_command(cfg),
         seccomp_profile=profile,
-        mounts=[sandbox.Mount(models_dir, "/models", shared_label=True),
-                sandbox.Mount(cfg.socket_dir, "/run/silo", writable=True)],
+        mounts=mounts,
         detach=True,
         gpu=cfg.runtime.gpu,
-        umask="0000",  # socket must be connectable by the host user (outside the sandbox's subuid)
+        umask="0000" if gvisor(cfg) else "0022",  # the host-side socket must be connectable by this user
         remove=False,  # keep logs of a failed start; `silo down` / the next `silo up` removes it
     )
     deadline = time.monotonic() + cfg.runtime.startup_timeout
-    watcher = SocketDirWatcher(cfg, deadline)
-    watcher.start()  # before the container exists, so it is already watching when the socket appears
+    lock = GvisorSocketLock(cfg, deadline) if gvisor(cfg) else None
+    if lock:
+        lock.start()  # before the container exists, so it is already watching when the socket appears
     try:
-        res = run(args, check=False)
-        if res.returncode != 0:
-            raise LaunchError(f"podman run failed:\n{safe_text(res.stderr.strip())}")
-        _wait_until_healthy(cfg, watcher, deadline)
+        if exec_lock(cfg):
+            start_exec_supervisor(cfg, cfg.socket_dir)  # before the container: the runtime reports to it
+        code, err = run_detached(scoped(cfg, args))
+        if code != 0:
+            raise LaunchError(f"podman run failed:\n{safe_text(err.strip())}")
+        if not lock:
+            try:
+                start_connector(cfg, container_pid(cfg.container_name))
+            except LaunchError:
+                _raise_if_exited(cfg)  # a runtime that died at once is the news, not the connector missing it
+                raise
+        _wait_until_healthy(cfg, deadline, lock)
     except BaseException:
-        watcher.cancel()
         down(cfg)  # fail closed: nothing half-started is left behind
         raise
 
 
-def _wait_until_healthy(cfg: Config, watcher: SocketDirWatcher, deadline: float) -> None:
+def _raise_if_exited(cfg: Config) -> None:
+    name = cfg.container_name
+    if not container_running(name):
+        raise LaunchError(f"{name} exited during startup ({_exit_hint(cfg)}):\n{_tail_logs(name)}") from None
+
+
+def _wait_until_healthy(cfg: Config, deadline: float, lock: GvisorSocketLock | None = None) -> None:
     name = cfg.container_name
     last = None
     while time.monotonic() < deadline:
-        if watcher.error:
-            raise watcher.error
-        if not container_running(name):
-            raise LaunchError(f"{name} exited during startup ({_exit_hint(name)}):\n{_tail_logs(name)}")
-        if watcher.locked.is_set():  # never talk to the socket before the directory is frozen and checked
-            last = health(cfg.socket_path)
-            if last == 200:
-                return
-        if watcher.locked.is_set():
-            time.sleep(0.5)
-        else:
-            watcher.locked.wait(0.5)
+        _raise_if_exited(cfg)
+        if lock and lock.error:
+            raise lock.error
+        if lock and not lock.locked.is_set():  # never talk to the socket before it is locked and checked
+            lock.locked.wait(0.5)
+            continue
+        last = health(cfg)
+        if last == 200:
+            return
+        time.sleep(0.5)
     raise LaunchError(f"model not healthy within {cfg.runtime.startup_timeout:.0f}s (last status {last}):\n"
                       f"{_tail_logs(name)}")
 
@@ -299,28 +483,56 @@ def _wait_until_healthy(cfg: Config, watcher: SocketDirWatcher, deadline: float)
 def down(cfg: Config) -> bool:
     was_running = container_running(cfg.container_name)
     if was_running:
-        run(["podman", "stop", "--time", "10", cfg.container_name], check=False)
+        grace = GVISOR_STOP_GRACE if gvisor(cfg) else STOP_GRACE
+        run(["podman", "stop", "--time", str(grace), cfg.container_name], check=False)
     _remove(cfg.container_name)
+    stop_connector(cfg)
+    _stop_helper(cfg.socket_dir / EXEC_PIDFILE)
     if cfg.socket_dir.exists() or cfg.socket_dir.is_symlink():
         _remove_dir(cfg.socket_dir)
     return was_running
 
 
+def runtime_reachable(cfg: Config) -> bool:
+    """Whether the runtime can be reached: the connector, or on gVisor the locked host-side socket."""
+    if gvisor(cfg):
+        try:
+            st = os.lstat(cfg.gvisor_socket_dir)
+        except OSError:
+            return False
+        locked = stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
+        return locked and _is_socket(cfg.gvisor_socket_path)
+    return connector_pid(cfg) is not None and _is_socket(cfg.control_path)
+
+
+def exec_lock_state(cfg: Config) -> str:
+    if gvisor(cfg):
+        return "not available on gVisor"
+    if not cfg.runtime.exec_lock:
+        return "off (runtime.exec_lock = false)"
+    return "on" if _helper_pid(cfg.socket_dir / EXEC_PIDFILE) else "on (supervisor not running)"
+
+
 def status(cfg: Config) -> dict:
     running = container_running(cfg.container_name)
-    locked = socket_dir_locked(cfg)
+    reachable = runtime_reachable(cfg)
     return {
         "name": cfg.name,
         "container": cfg.container_name,
         "running": running,
-        "socket": str(cfg.socket_path),
-        "socket_dir_locked": locked,
-        "health": health(cfg.socket_path) if running and locked else None,
+        "kernel": f"gvisor ({cfg.runtime.gvisor_platform})" if gvisor(cfg) else "host",
+        "socket": str(runtime_path(cfg)),
+        "reached_through": "locked socket directory" if gvisor(cfg) else "connector",
+        "reachable": reachable,
+        "health": health(cfg) if running and reachable else None,
+        "exec_lock": exec_lock_state(cfg),
+        "execs_refused": execs_refused(cfg.socket_dir) if exec_lock(cfg) else None,
         "image": cfg.runtime.image,
         "seccomp_action": cfg.runtime.seccomp_action,
         "gateway": f"http://{cfg.gateway.listen}:{cfg.gateway.port}/v1",
         "scanner": cfg.gateway.scanner,
         "allow_tools": cfg.gateway.allow_tools,
+        "tools": list(cfg.gateway.tools),
         "audit_log": str(cfg.audit_log),
     }
 
@@ -352,21 +564,32 @@ def probe(cfg: Config, baseline: bool = False) -> tuple[int, list[dict]]:
     if baseline:
         args = ["podman", "run", "--rm", "--interactive", "--pull=never", image, "python3", "-I", "-"]
     else:
-        profile = prepare_seccomp(cfg)
+        # The probe run's own runtime directory: its exec supervisor's files, never mounted anywhere.
         scratch = Path(tempfile.mkdtemp(prefix="probe-", dir=_private_root()))
-        os.chmod(scratch, 0o755)  # the steady state of the model's socket directory: locked
-        mounts = [sandbox.Mount(scratch, "/run/silo", writable=True)]
+        mounts = []
         if cfg.model.dir and cfg.model.dir.is_dir():
-            mounts.insert(0, sandbox.Mount(cfg.model.dir, "/models", shared_label=True))
-        args = sandbox.podman_run_args(
-            cfg, name=f"{cfg.container_name}-probe", image=image, command=["python3", "-I", "-"],
+            mounts.append(sandbox.Mount(cfg.model.dir, "/models", shared_label=True))
+        if gvisor(cfg):  # the steady state of the runtime's socket directory: shared, and locked
+            shared = scratch / "sock"
+            shared.mkdir()
+            os.chmod(shared, 0o755)
+            mounts.append(sandbox.Mount(shared, GVISOR_SOCKET_DIR_IN_CONTAINER, writable=True))
+        locked = exec_lock(cfg)
+        profile = prepare_seccomp(cfg, exec_dir=scratch if locked else None, probe=True)
+        flags = [*(["--gpu"] if cfg.runtime.gpu != "none" else []), *(["--gvisor"] if gvisor(cfg) else []),
+                 *([] if locked else ["--no-exec-lock"])]
+        args = scoped(cfg, sandbox.podman_run_args(
+            cfg, name=f"{cfg.container_name}-probe", image=image, command=["python3", "-I", "-", *flags],
             seccomp_profile=profile, mounts=mounts, interactive=True, memory="512m", gpu=cfg.runtime.gpu,
-        )
+        ), memory="512m")
     try:
+        if scratch and exec_lock(cfg):
+            start_exec_supervisor(cfg, scratch)
         res = subprocess.run(args, input=probe_script(), text=True, capture_output=True, timeout=300,
                              errors="replace")
     finally:
         if scratch:
+            _stop_helper(scratch / EXEC_PIDFILE)
             _remove_dir(scratch)
     results, summary = [], None
     for line in res.stdout.splitlines():

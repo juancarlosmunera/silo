@@ -4,6 +4,7 @@
 nowhere to go, and one narrow, logged channel for prompts and answers.
 
 [![ci](https://github.com/juancarlosmunera/silo/actions/workflows/ci.yml/badge.svg)](https://github.com/juancarlosmunera/silo/actions/workflows/ci.yml)
+[![sandbox](https://github.com/juancarlosmunera/silo/actions/workflows/sandbox.yml/badge.svg)](https://github.com/juancarlosmunera/silo/actions/workflows/sandbox.yml)
 
 When you run open-weight models on your own machine or on a VPS, you load a multi-gigabyte file
 from the internet into a runtime that parses it, usually on a box that also holds your SSH keys,
@@ -21,14 +22,16 @@ anything on the host. What it can still do is answer, so the answer is the one c
 the gateway exists to narrow and record it.
 
 > **Status: 0.1, early.** Verified on Fedora 43 (SELinux enforcing) with rootless Podman 5.6 and
-> 5.8, x86_64, CPU inference, running llama.cpp's server. Also exercised on Ubuntu 24.04, where one
-> layer is missing ([details](docs/VPS.md#other-distributions)). Not yet verified: GPU passthrough,
-> aarch64. silo lowers risk; it is not a guarantee. Read [Limits](#limits) before relying on it.
+> 5.8, x86_64, running llama.cpp's server. The escape probes and a small model also run in CI for
+> every change, on Ubuntu 24.04 with Podman 4.9, on x86_64 and aarch64, on the host kernel and on
+> gVisor; one layer is missing on Ubuntu ([details](docs/VPS.md#other-distributions)). GPU
+> passthrough is verified on an Intel GPU (`gpu = "dri"`, llama.cpp's Vulkan image) and not on
+> NVIDIA or AMD. silo lowers risk; it is not a guarantee. Read [Limits](#limits) before relying on it.
 
 **Contents:** [Isn't a container enough?](#isnt-a-container-enough) ·
 [How it works](#how-it-works) · [Check it yourself](#check-it-yourself) ·
 [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start) ·
-[On a VPS](#on-a-vps) · [In a local VM](#in-a-local-vm) · [Commands](#commands) ·
+[On a VPS](#on-a-vps) · [In a local VM](#in-a-local-vm) · [On gVisor](#on-gvisor) · [Commands](#commands) ·
 [Configuration](#configuration) ·
 [The gateway](#the-gateway) ·
 [Tightening it further](#tightening-it-further) · [Limits](#limits) · [Roadmap](#roadmap) ·
@@ -46,7 +49,7 @@ network. A model only produces text. For it to reach the net, one of these has t
 | | Route | What silo does about it |
 |---|---|---|
 | 1 | **Someone hands it a tool.** Web fetch, shell or code execution, wired up by an agent framework or a runtime flag. By far the most common way. | Refuses the llama-server flags that enable tools, agents, MCP, remote backends and downloads. The gateway refuses tool calling unless you turn it on. The model can only return text. |
-| 2 | **Code runs inside the runtime.** A crafted model file exploits the loader, or a pickle checkpoint executes on load. | Intake rejects pickles, code and anything that is not a vetted format. The runtime has no network device, cannot create an internet socket, cannot create namespaces to get around either, holds no privileges and has nowhere to put a binary. |
+| 2 | **Code runs inside the runtime.** A crafted model file exploits the loader, or a pickle checkpoint executes on load. | Intake rejects pickles, code and anything that is not a vetted format. The runtime has no network device, cannot create an internet socket, cannot create namespaces to get around either, holds no privileges, has nowhere to put a binary and cannot start another program. |
 | 3 | **Its text gets someone else to do it.** "Run this command", or an image link that your chat UI fetches on its own. | The gateway re-serialises, scans and logs every completion, and can withhold the obvious cases. |
 
 Routes 1 and 2 are closed by construction and checked by a test suite you can run yourself.
@@ -58,10 +61,11 @@ first item under [Limits](#limits).
 | Way out | Control |
 |---|---|
 | **Network** | `--network=none`: a private loopback, no routes, no resolver. Independently, seccomp allows `socket()` and `socketpair()` for `AF_UNIX` only and denies the ways around that filter: io_uring, `socketcall`, and the 32-bit and x32 syscall ABIs. Optionally, a host firewall rule drops everything the sandbox user originates ([host/](host/README.md)). |
-| **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. |
+| **Kernel attack surface** | The distribution's seccomp profile, tightened: no new namespaces (`unshare`, `setns`, `clone` namespace flags, `clone3`), no mount API, bpf, perf, userfaultfd, keyrings, ptrace, `process_vm_*`, file handles, SysV/POSIX message queues, splice family or legacy AIO. No pty can be allocated. Kernel symbol, module and boot-parameter files are masked. On CPU-only sandboxes, `ioctl`, `prctl` and `setsockopt` are limited to the argument values an inference server uses, measured on llama-server: no driver ioctls, no socket filters. |
 | **Privilege** | Rootless Podman, so container root is not host root. The runtime runs as `nobody`, mapped to a subordinate UID that owns nothing on the host. Every capability dropped, bounding set included. `no-new-privileges`. SELinux `container_t` with per-container categories. |
 | **Filesystem, persistence** | Read-only root. Model directory mounted read-only. The only writable location is a 64 MB `noexec` tmpfs. No `memfd_create` on CPU-only sandboxes, so no fileless exec either. Environment stripped. No Podman, D-Bus, display, audio or agent sockets visible. |
-| **The shared socket directory** | The one host directory the sandbox can touch is locked within about a millisecond of the runtime binding its socket. From then on the sandbox cannot fill it or swap the socket for a symlink to another host socket, and anything found in it besides that socket fails the launch. |
+| **Running other programs** | Once the runtime has started, nothing else can be executed in the sandbox. Every `execve` is put to a supervisor on the host, which lets the container's own first one through and refuses the rest. The shell, `curl` and Python that ship in the runtime image are of no use to a compromised runtime, and neither is a binary it brought along. Not available on gVisor. |
+| **The runtime's socket** | No host directory is shared with the sandbox. llama-server listens on an abstract UNIX socket, which exists only inside its own network namespace; a small connector started through `podman unshare` joins that namespace, drops every capability and hands each connection to the gateway, which checks the peer is the sandbox's UID. |
 | **Resources** | Memory cap with no swap, PID cap, file-descriptor cap, size-capped log. |
 | **Model files** | `silo intake`: format allowlist (GGUF, safetensors), magic-byte checks, GGUF headers parsed in full and every tensor checked against the file, no pickles, code or symlinks, and a SHA-256 manifest kept outside the model directory and checked before every launch. |
 | **The runtime's own features** | llama-server flags that add listeners, downloads, tools, agents, MCP or remote backends are refused. Web UI, slots and the MCP proxy are switched off. Images are never pulled at launch. |
@@ -73,19 +77,20 @@ The reasoning behind each control, and what is left over, is in
 ## Check it yourself
 
 None of the above is taken on trust. `silo probe` starts a sandbox with exactly the flags the model
-gets and runs 66 probes inside it: reach the network through a dozen socket types, create
-namespaces, call the kernel interfaces listed above, find a location that is both writable and
+gets and runs 76 probes inside it: reach the network through a dozen socket types, create
+namespaces, call the kernel interfaces listed above, use syscall arguments outside the allowlists,
+start a second program, find a location that is both writable and
 executable, find host sockets and credentials, and check the process's own privileges and limits.
 `silo probe --baseline` runs the same probes in a stock rootless Podman container.
 
 | | stock rootless Podman | silo |
 |---|---|---|
-| contained (PASS) | 26 | 66 |
-| not contained (FAIL) | 31 | 0 |
+| contained (PASS) | 27 | 76 |
+| not contained (FAIL) | 41 | 0 |
 | weaker than intended (WARN) | 7 | 0 |
 
-These are the numbers from the development machine. Two probes are skipped in the baseline because
-it has no model or socket mounts. Stock Podman is a good default for software you trust. It is not
+These are the numbers from the development machine. One probe is skipped in the baseline because
+it has no model directory mounted. Stock Podman is a good default for software you trust. It is not
 built for software you assume is trying to leave.
 
 With `seccomp_action = "kill"`, every denied syscall in the probe output reads
@@ -168,7 +173,7 @@ silo probe      # run the escape probes in a sandbox identical to the model's
  PASS sys.unshare                    unshare(CLONE_NEWUSER): refused (EPERM)
  PASS fs.writable_noexec             writable locations ['/tmp'] are all noexec
  ...
-PASS=66  FAIL=0  WARN=0  SKIP=0
+PASS=76  FAIL=0  WARN=0  SKIP=0
 ```
 
 **4. Start it.**
@@ -180,8 +185,8 @@ silo up
 ```
 silo[default] config: /home/you/.config/silo/silo.toml
 silo[default] starting silo-default from ghcr.io/ggml-org/llama.cpp:server
-silo[default] model healthy on /run/user/1000/silo/default/llama.sock (socket directory locked)
-silo[default] gateway on http://127.0.0.1:8088/v1  ->  /run/user/1000/silo/default/llama.sock
+silo[default] model healthy, reached through /run/user/1000/silo/default/control.sock (connector; no shared directory; exec lock on)
+silo[default] gateway on http://127.0.0.1:8088/v1  ->  /run/user/1000/silo/default/control.sock (connector)
 silo[default] scanner=monitor tools=refused audit=/home/you/.local/state/silo/audit/default.jsonl
 ```
 
@@ -203,10 +208,10 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
-Streaming works the same way. Browser-based clients are refused: any request that carries an
-`Origin` header is.
+Streaming works the same way. Browser-based clients are refused (any request that carries an
+`Origin` header is) unless their origin is listed in `gateway.allowed_origins`.
 
-Ctrl-C stops the gateway and the sandbox and removes the socket directory.
+Ctrl-C stops the gateway, the sandbox and the connector.
 
 ## On a VPS
 
@@ -235,6 +240,25 @@ bin/silo-vm start       # from now on: no network device
 
 It needs KVM and costs the guest's memory. In a quick test, inference in the VM was as fast as on
 the host. [docs/LOCAL_VM.md](docs/LOCAL_VM.md) has the walkthrough, tested from a fresh VM.
+
+## On gVisor
+
+A second kernel without a virtual machine. With [gVisor](https://gvisor.dev) installed and
+
+```toml
+[runtime]
+runsc = "/usr/local/bin/runsc"
+```
+
+silo starts the same sandbox on gVisor's user-space kernel: the runtime's system calls are served
+by gVisor and no longer reach your kernel directly, and the process a break-out would land in is
+an unprivileged UID with no capabilities. silo's own controls, its seccomp profile included, still
+apply inside, and the escape probes pass there.
+
+It is a trade, not a free addition: SELinux does not confine a gVisor sandbox, one directory is
+shared with it for the runtime's socket, the exec lock is not available there, and inference was
+about 20% slower in a quick test (8% on gVisor's KVM platform). [docs/GVISOR.md](docs/GVISOR.md) has the installation, what silo asks of
+gVisor and why, and the measurements.
 
 ## Commands
 
@@ -269,11 +293,17 @@ The settings that matter most. Every option, with comments, is in
 | `runtime.memory` | `"8g"` | Hard memory cap, with no swap on top. It has to fit the model plus its context. |
 | `runtime.seccomp_action` | `"errno"` | `"errno"` makes denied syscalls fail. `"kill"` terminates the runtime on the first one. |
 | `runtime.image` | llama.cpp server | Pin it with the image ID printed by `silo images`. |
-| `runtime.gpu` | `"none"` | GPU passthrough. Exposes a GPU driver to the sandbox and is not yet verified. |
+| `runtime.exec_lock` | `true` | After the runtime has started, refuse every `execve` in the sandbox. Turn it off only for an image whose entrypoint is a wrapper that starts the real server. |
+| `runtime.runsc` | none | Path to gVisor's `runsc`: run the sandbox on gVisor's user-space kernel. See [docs/GVISOR.md](docs/GVISOR.md). |
+| `runtime.gvisor_platform` | `"systrap"` | With `runsc`: `"systrap"` works everywhere, `"kvm"` is faster and hands `/dev/kvm` to gVisor. |
+| `runtime.gpu` | `"none"` | GPU passthrough: `"dri"` (Vulkan: Intel, AMD), `"amd"` (ROCm), `"nvidia"` (CDI). Exposes a GPU driver to the sandbox; DRM GPUs get their render nodes only. Verified with `"dri"` on Intel. |
 | `gateway.listen`, `gateway.port` | `127.0.0.1`, `8088` | A non-loopback address is refused unless `api_key_env` is set. |
 | `gateway.scanner` | `"monitor"` | `"off"`, `"monitor"` (log and alert) or `"enforce"` (withhold high-severity completions). |
 | `gateway.allow_tools` | `false` | Tool calling. When on, whatever executes the calls is outside the silo. |
+| `gateway.tools` | `[]` | With tool calling on: the only tool names a request may offer. Empty means any. |
+| `gateway.max_tool_arguments_bytes` | `32768` | Cap on the arguments of each tool call the model makes. |
 | `gateway.log_content` | `false` | Record prompts and completions in the audit log, not only their hashes. |
+| `gateway.allowed_origins` | `[]` | Browser origins allowed to call the gateway, exactly as the browser sends them, e.g. `"http://localhost:3000"`. |
 | `gateway.api_key_env` | none | Name of an environment variable holding a bearer token that clients must send. |
 
 ## The gateway
@@ -288,10 +318,19 @@ The gateway treats both sides as untrusted and terminates the protocol instead o
 - **Nothing renderable.** The gateway sets the response type itself (JSON or an event stream) and
   sends `nosniff` and a deny-all CSP, so a compromised runtime cannot serve a page to a browser that
   opens the gateway URL.
-- **No drive-by access.** Requests with an `Origin` header, a non-loopback `Host` (DNS rebinding)
-  or a POST that is not `application/json` are refused.
+- **No drive-by access.** Requests with a non-loopback `Host` (DNS rebinding) or a POST that is not
+  `application/json` are refused, and so are requests with an `Origin` header, unless that exact
+  origin is listed in `gateway.allowed_origins`. Listed origins get CORS headers and their
+  preflights are answered by the gateway itself; the response never allows credentials, and the
+  API key, if set, is still required. A listed page can use the model, and so can any script that
+  runs on it, so list only clients you trust and keep them from rendering remote images or HTML.
 - **Text only by default.** Requests that carry tools or functions are refused, and tool calls from
   the model are cut off, unless `allow_tools = true`.
+- **Per-tool policy when tools are on.** `gateway.tools` lists the tools a client may offer; anything
+  else is refused before it reaches the model. The model may only call a tool the request offered:
+  a call to anything else, a call that changes its name mid-stream or sends arguments before naming
+  a tool is cut off, and arguments are capped per call. The audit log records the tools offered and
+  the tools called.
 - **Output tripwire.** Completions are scanned for the usual ways text borrows someone else's
   network or hands: pipe-to-shell, reverse shells, remote images that a markdown renderer would
   fetch on its own, raw terminal escape sequences, sandbox-weakening flags, hidden Unicode,
@@ -315,7 +354,8 @@ The defaults favour getting a model running. Once yours runs cleanly:
 5. Set `gateway.api_key_env` if other users or untrusted processes share the machine.
 6. Put a second boundary around all of it: [a VM with no network device](#in-a-local-vm) on your
    own machine, or [a dedicated, sealed server](#on-a-vps). Everything above narrows the way to a
-   kernel exploit. This is the step that limits what one would reach.
+   kernel exploit. This is the step that limits what one would reach. [gVisor](#on-gvisor) is the
+   lighter option: it puts a second kernel in the way on the machine you already use.
 
 `silo doctor` lists whichever of these are still open.
 
@@ -326,25 +366,21 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 - **The kernel is shared.** A kernel vulnerability reachable through the roughly 320 syscalls still
   allowed is the main way out of the sandbox. silo shrinks that surface; it does not remove it.
   Put a second boundary around it: a VM with no network device on your own machine
-  ([docs/LOCAL_VM.md](docs/LOCAL_VM.md)), or a dedicated, sealed server ([docs/VPS.md](docs/VPS.md)).
+  ([docs/LOCAL_VM.md](docs/LOCAL_VM.md)), a dedicated, sealed server ([docs/VPS.md](docs/VPS.md)), or
+  gVisor's user-space kernel ([docs/GVISOR.md](docs/GVISOR.md)).
 - **The answer still reaches you.** A model with no network can ask you to run something. The
   tripwire catches obvious shapes and is a regex, not a boundary. Treat output as untrusted input.
 - **Your client is outside the silo.** If it renders HTML, fetches images or executes tool calls,
   that is where containment now has to hold.
 - **Loopback is shared.** Any process on the machine can talk to the gateway unless you set an API
   key.
-- **GPU passthrough** exposes a large driver to the sandbox and is unverified.
+- **GPU passthrough** exposes a large driver to the sandbox. It is verified on an Intel GPU only.
 - **Covert channels** (timing, load) are out of scope.
 
 ## Roadmap
 
-- A lighter second kernel boundary than a full VM: gVisor as the sandbox runtime.
 - Mandatory access control for the sandbox on AppArmor hosts such as Ubuntu.
-- Handing the runtime's socket to the gateway without a shared host directory.
-- Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
-- An origin allowlist with proper CORS handling, for browser-based clients.
-- Per-tool policy for tool calling, in place of all-or-nothing.
-- Verification on GPU hardware, aarch64 and hosts without SELinux.
+- Verification on NVIDIA and AMD GPUs.
 
 ## Development
 
@@ -352,17 +388,22 @@ Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before relying on silo. The sh
 PYTHONPATH=src python3 -m unittest discover -s tests   # no network, no Podman needed
 ```
 
-The unit tests run in CI on Python 3.11 and 3.13. The escape probes need a real Podman host, so
-run `silo probe` and `silo probe --baseline` locally when you change anything in `sandbox.py`,
-`seccomp.py` or `runtime.py`.
+The unit tests run in CI on Python 3.11 and 3.13. A second workflow (`sandbox.yml`) runs the escape
+probes in both seccomp modes and a small model in a silo, on x86_64 and aarch64, on the host kernel
+and on gVisor, and fails on any probe that is not contained. It runs on GitHub's Ubuntu machines,
+so it does not cover SELinux: run `silo probe` and `silo probe --baseline` on your own host as well
+when you change anything in `sandbox.py`, `seccomp.py`, `runtime.py`, `connector.py` or
+`execlock.py`.
 
 ```
 src/silo/sandbox.py     the podman flags, and the check that refuses to launch without them
 src/silo/seccomp.py     profile hardening, with the reason for every denied syscall
 src/silo/gateway.py     the host-side proxy
+src/silo/connector.py   reaches the runtime's socket inside the sandbox's network namespace
+src/silo/execlock.py    the supervisor that refuses every execve after the runtime's own
 src/silo/scanner.py     output tripwire rules
 src/silo/intake.py      model-directory vetting and manifest
-src/silo/runtime.py     lifecycle: launch, socket-directory lock, probes
+src/silo/runtime.py     lifecycle: launch, connector, probes
 src/silo/probes/        the escape-probe suite that runs inside the sandbox
 src/silo/doctor.py      host and configuration checks
 src/silo/hostrules.py   host firewall rule generation
@@ -373,6 +414,7 @@ examples/               annotated configuration, systemd unit
 docs/THREAT_MODEL.md    assumptions, controls, residual risk
 docs/VPS.md             deploying on a rented server, step by step
 docs/LOCAL_VM.md        a second kernel on your own machine: silo inside a VM
+docs/GVISOR.md          a second kernel without a VM: silo on gVisor
 ```
 
 ## Security

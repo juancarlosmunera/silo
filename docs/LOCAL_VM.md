@@ -130,7 +130,7 @@ the two image IDs, `memory`, `seccomp_action = "kill"`, `scanner = "enforce"`. T
 ```sh
 ~/silo/bin/silo intake
 ~/silo/bin/silo doctor --sealed     # every egress line says "blocked (Network is unreachable)"
-~/silo/bin/silo probe               # ends with PASS=66  FAIL=0  WARN=0
+~/silo/bin/silo probe               # ends with FAIL=0  WARN=0
 ```
 
 Install the service, together with the drop-in that keeps the model from starting whenever the VM

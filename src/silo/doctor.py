@@ -64,21 +64,30 @@ def _podman_info() -> dict | None:
         return None
 
 
-def kernel_isolation_check(virt: str | None, sealed: bool | None, unused_runtimes: list[str]) -> Check:
+def kernel_isolation_check(virt: str | None, sealed: bool | None, unused_runtimes: list[str],
+                           gvisor: str | None = None, runsc_on_path: str | None = None) -> Check:
     """What stands between a kernel exploit in the sandbox and the rest of the world.
 
-    The sandbox always shares a kernel with the machine it runs on. On a physical machine that is
-    the user's own. In a virtual machine it is the guest's, and the VM is a second boundary, but
-    only as far as the guest is sealed: `sealed` is None when that was not tested, else the result
-    of `silo doctor --sealed`.
+    Without gVisor the sandbox shares a kernel with the machine it runs on. On a physical machine
+    that is the user's own. In a virtual machine it is the guest's, and the VM is a second boundary,
+    but only as far as the guest is sealed: `sealed` is None when that was not tested, else the
+    result of `silo doctor --sealed`. With runtime.runsc (`gvisor` is then its version) the
+    sandbox's system calls are served by gVisor's user-space kernel instead.
     """
     name = "kernel isolation"
+    if gvisor is not None:
+        where = f", inside a virtual machine ({virt})" if virt else ""
+        return Check(name, OK, f"gVisor {gvisor}{where}: the sandbox's system calls are served by gVisor's "
+                     "user-space kernel, so a kernel exploit has to get through gVisor before it reaches this "
+                     "machine's kernel")
     if virt is None:
         unused = f" ({'/'.join(unused_runtimes)} is installed; silo does not use it yet)" if unused_runtimes else ""
+        fix = ("put a second boundary around it: gVisor (runtime.runsc, docs/GVISOR.md), a VM with no network "
+               "device (docs/LOCAL_VM.md) or a dedicated, sealed server (docs/VPS.md)")
+        if runsc_on_path:
+            fix = f'gVisor is installed: set runtime.runsc = "{runsc_on_path}" (docs/GVISOR.md). Or ' + fix[4:]
         return Check(name, WARN, "the sandbox shares this machine's kernel: a kernel vulnerability reachable through "
-                     f"the allowed syscalls leads to your own account{unused}",
-                     "put a second boundary around it: a VM with no network device (docs/LOCAL_VM.md) or a "
-                     "dedicated, sealed server (docs/VPS.md)")
+                     f"the allowed syscalls leads to your own account{unused}", fix)
     if sealed:
         return Check(name, OK, f"inside a virtual machine ({virt}) whose outbound traffic is blocked: a kernel "
                      "exploit from the sandbox is confined to this guest")
@@ -88,6 +97,45 @@ def kernel_isolation_check(virt: str | None, sealed: bool | None, unused_runtime
                      "seal it (docs/VPS.md), or use a VM with no network device (docs/LOCAL_VM.md)")
     return Check(name, WARN, f"inside a virtual machine ({virt}): that is a second boundary only if this machine "
                  "is sealed and holds nothing else", "confirm with `silo doctor --sealed`")
+
+
+def _runsc_version(path: Path) -> str | None:
+    try:
+        res = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = res.stdout.strip().splitlines()
+    if res.returncode != 0 or not lines or not lines[0].startswith("runsc version "):
+        return None
+    return lines[0][len("runsc version "):].strip()
+
+
+def gvisor_checks(cfg: Config) -> tuple[str | None, list[Check]]:
+    """Checks for a sandbox on gVisor: (runsc version or None, findings)."""
+    rt, checks = cfg.runtime, []
+    version = _runsc_version(rt.runsc)
+    if version is None:
+        return None, [Check("gVisor", BAD, f"`{rt.runsc} --version` failed", "reinstall gVisor (docs/GVISOR.md)")]
+    checks.append(Check("gVisor", OK, f"{version}, platform {rt.gvisor_platform}; its sentry runs as the sandbox's "
+                        "unprivileged UID with no capabilities (directfs off)"))
+    if shutil.which("systemd-run"):
+        checks.append(Check("gVisor resource limits", OK, "memory, tasks and CPU are limited by a systemd user scope "
+                            "around the whole gVisor sandbox"))
+    else:
+        checks.append(Check("gVisor resource limits", BAD, "systemd-run not found: silo cannot limit a gVisor sandbox "
+                            "and will refuse to start it"))
+    if rt.gvisor_platform == "kvm":
+        try:
+            usable = Path("/dev/kvm").stat().st_mode & 0o006 == 0o006
+        except OSError:
+            usable = False
+        if usable:
+            checks.append(Check("gVisor platform", WARN, "kvm: faster, and /dev/kvm is handed to gVisor's sentry",
+                                'runtime.gvisor_platform = "systrap" keeps KVM out of the sandbox\'s reach'))
+        else:
+            checks.append(Check("gVisor platform", BAD, "kvm: /dev/kvm is missing or not usable by the sandbox's "
+                                "unprivileged UID", 'use runtime.gvisor_platform = "systrap"'))
+    return version, checks
 
 
 def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
@@ -109,8 +157,13 @@ def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
               "" if sec.get("rootless") else "run silo as an unprivileged user"))
     runtime = host.get("ociRuntime", {}).get("name", "?")
     add(Check("OCI runtime", OK if runtime in ("crun", "runc") else WARN, runtime))
-    unused_runtimes = [name for name in ("runsc", "krun") if shutil.which(name)]
-    add(kernel_isolation_check(_virtualization(), sealed, unused_runtimes))
+    gvisor = None
+    if cfg.runtime.runsc is not None:
+        gvisor, found = gvisor_checks(cfg)
+        checks.extend(found)
+    unused_runtimes = [name for name in ("krun",) if shutil.which(name)]
+    runsc_on_path = shutil.which("runsc") if cfg.runtime.runsc is None else None
+    add(kernel_isolation_check(_virtualization(), sealed, unused_runtimes, gvisor, runsc_on_path))
     cg = host.get("cgroupVersion")
     add(Check("cgroups", OK if cg == "v2" else BAD, f"cgroup {cg}",
               "" if cg == "v2" else "rootless resource limits require cgroup v2"))
@@ -122,12 +175,20 @@ def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
 
     enforce_file = Path("/sys/fs/selinux/enforce")
     enforcing = enforce_file.exists() and enforce_file.read_text().strip() == "1"
-    if sec.get("selinuxEnabled") and enforcing:
+    if sec.get("selinuxEnabled") and enforcing and cfg.runtime.runsc is not None:
+        add(Check("SELinux", WARN, "enforcing, but it does not confine a gVisor sandbox: runsc refuses SELinux "
+                  "labels, so gVisor's own processes run in the container runtime's domain",
+                  "this is the trade for the second kernel (docs/GVISOR.md); without runtime.runsc the sandbox "
+                  "is confined as container_t"))
+    elif sec.get("selinuxEnabled") and enforcing:
         add(Check("SELinux", OK, "enforcing (sandbox confined as container_t with its own MCS categories)"))
     elif sec.get("selinuxEnabled"):
         add(Check("SELinux", BAD, "enabled but permissive", "sudo setenforce 1 and persist in /etc/selinux/config"))
     elif sec.get("apparmorEnabled"):
         add(Check("LSM", WARN, "AppArmor only; SELinux MCS separation is stronger"))
+    elif cfg.runtime.runsc is not None:
+        add(Check("LSM", WARN, "no SELinux/AppArmor confinement; under gVisor the user-space kernel is the "
+                  "confinement layer"))
     else:
         add(Check("LSM", BAD, "no SELinux/AppArmor confinement"))
 
@@ -180,21 +241,41 @@ def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
                   "memfd_create stays allowed", "GPU drivers are large kernel attack surface; prefer CPU for "
                   "untrusted models"))
     if cfg.runtime.seccomp_action == "kill":
-        add(Check("seccomp action", OK, "kill: the first denied syscall terminates the runtime"))
+        add(Check("seccomp action", OK, "kill: the first call to a syscall silo denies terminates the runtime (syscalls the kernel or the base profile refuse still fail with an error)"))
     else:
         add(Check("seccomp action", WARN, "errno: denied syscalls fail quietly, so a compromised runtime can "
                   "keep probing", 'runtime.seccomp_action = "kill" once your model runs cleanly'))
+    if cfg.runtime.runsc is not None:
+        add(Check("exec lock", WARN, "not available on gVisor (it has no seccomp user notification): programs in "
+                  "the image can be executed inside the sandbox", "this is part of the trade for the second kernel "
+                  "(docs/GVISOR.md)"))
+    elif cfg.runtime.exec_lock:
+        add(Check("exec lock", OK, "on: once the runtime has started, nothing else can be executed in the sandbox"))
+    else:
+        add(Check("exec lock", WARN, "off: the shell, interpreters and tools in the image can be executed by a "
+                  "compromised runtime", "runtime.exec_lock = true, unless the image's entrypoint is a wrapper "
+                  "that starts the real server"))
     if cfg.gateway.scanner == "enforce":
         add(Check("output scanner", OK, "enforce: high-severity completions are withheld"))
     else:
         add(Check("output scanner", WARN, f"{cfg.gateway.scanner}: suspicious completions are "
                   f"{'logged but not' if cfg.gateway.scanner == 'monitor' else 'neither logged nor'} blocked",
                   'gateway.scanner = "enforce" (streams are then delivered only once complete)'))
-    if cfg.gateway.allow_tools:
-        add(Check("tool calling", WARN, "allowed: whatever executes the model's tool calls is outside the silo",
-                  "that executor is now your containment boundary; sandbox it too"))
+    if cfg.gateway.allow_tools and cfg.gateway.tools:
+        add(Check("tool calling", WARN, f"allowed for {', '.join(cfg.gateway.tools)}: whatever executes those calls "
+                  "is outside the silo", "that executor is now your containment boundary; sandbox it too"))
+    elif cfg.gateway.allow_tools:
+        add(Check("tool calling", WARN, "allowed for any tool a client offers: whatever executes the model's tool "
+                  "calls is outside the silo", "list the tools you mean to allow in gateway.tools, and sandbox "
+                  "their executor too"))
     else:
         add(Check("tool calling", OK, "refused: the model can only produce text"))
+    if cfg.gateway.allowed_origins:
+        key = "with" if cfg.gateway.api_key_env else "without"
+        add(Check("browser origins", WARN, f"{', '.join(cfg.gateway.allowed_origins)} may call the gateway {key} an "
+                  "API key: any script running on those pages can too, and the page renders the output",
+                  "set gateway.api_key_env, and make sure the client does not render remote images or HTML"
+                  if not cfg.gateway.api_key_env else "make sure the client does not render remote images or HTML"))
     checks.extend(session_checks())
     return checks
 

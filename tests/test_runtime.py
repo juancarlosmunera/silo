@@ -1,5 +1,7 @@
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -18,11 +20,24 @@ def cfg_with(extra=()):
     return cfg
 
 
+def stand_in_helper(test, pidfile):
+    """A process started with `pidfile` in its arguments, as silo's helpers are."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "--pidfile", str(pidfile)])
+    test.addCleanup(proc.wait)
+    test.addCleanup(proc.kill)
+    deadline = time.monotonic() + 10
+    while os.fsencode(str(pidfile)) not in Path(f"/proc/{proc.pid}/cmdline").read_bytes().split(b"\0"):
+        if time.monotonic() > deadline:
+            test.fail("the stand-in helper did not start")
+        time.sleep(0.01)
+    return proc
+
+
 class ServerCommandTests(unittest.TestCase):
     def test_server_command(self):
         cmd = runtime.server_command(cfg_with(["--n-gpu-layers", "0", "--jinja", "--temp", "-1"]))
         self.assertEqual(cmd[:4], ["--model", "/models/kimi/Kimi-K2-Q2_K-00001-of-00008.gguf",
-                                   "--host", runtime.SOCKET_IN_CONTAINER])
+                                   "--host", "@" + runtime.ABSTRACT_SOCKET])
         for switch in runtime.SAFETY_SWITCHES:
             self.assertIn(switch, cmd)
         self.assertEqual(cmd[-5:], ["--n-gpu-layers", "0", "--jinja", "--temp", "-1"])
@@ -33,6 +48,14 @@ class ServerCommandTests(unittest.TestCase):
                      "--top-k", "--seed", "--threads-batch", "--device", "--main-gpu", "--tensor-split"):
             with self.subTest(flag=flag):
                 runtime.check_extra_args([flag, "1"])
+
+    def test_underscore_spellings_are_the_same_flags(self):
+        # llama.cpp reads underscores in long options as dashes
+        for flag in ("--mcp_servers_json", "--MCP-servers-json", "--model_url=x", "--hf_repo", "--slot_save_path",
+                     "--webui_mcp_proxy", "--connect", "--connect_code", "--api_key"):
+            with self.subTest(flag=flag), self.assertRaises(ConfigError):
+                runtime.check_extra_args([flag, "1"])
+        runtime.check_extra_args(["--n_gpu_layers", "0"])
 
     def test_dangerous_server_flags_rejected(self):
         for flag in ("--tools=all", "--agent", "-ag", "--rpc", "-hf", "--hf-repo", "--model-url", "-mu", "--host",
@@ -64,8 +87,132 @@ class ServerCommandTests(unittest.TestCase):
         compile(script, "escape_probes.py", "exec")
 
 
-class SocketDirTests(unittest.TestCase):
-    """The one host directory shared with the sandbox."""
+def gvisor_cfg(**model):
+    cfg = cfg_with()
+    cfg.runtime.runsc = Path("/usr/local/bin/runsc")
+    for key, value in model.items():
+        setattr(cfg.model, key, value)
+    return cfg
+
+
+class GvisorCommandTests(unittest.TestCase):
+    def test_runtime_listens_in_the_mounted_directory(self):
+        with mock.patch.object(runtime, "physical_cores", return_value=None):
+            cmd = runtime.server_command(gvisor_cfg())
+        self.assertEqual(cmd[2:4], ["--host", "/run/silo/llama.sock"])
+        self.assertNotIn("--threads", cmd)
+        self.assertEqual(runtime.server_command(cfg_with())[2:4], ["--host", "@" + runtime.ABSTRACT_SOCKET])
+
+    def test_threads_default_to_physical_cores_on_gvisor_only(self):
+        with mock.patch.object(runtime, "physical_cores", return_value=6):
+            cmd = runtime.server_command(gvisor_cfg())
+            self.assertEqual(cmd[cmd.index("--threads") + 1], "6")
+            cmd = runtime.server_command(gvisor_cfg(threads=2))  # an explicit setting wins
+            self.assertEqual(cmd[cmd.index("--threads") + 1], "2")
+            self.assertNotIn("--threads", runtime.server_command(cfg_with()))  # llama.cpp decides on the host kernel
+
+    def test_physical_cores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sysfs = Path(tmp)
+            layout = {0: ("0", "0"), 1: ("0", "1"), 2: ("0", "0"), 3: ("0", "1"), 4: ("1", "0"), 5: ("1", "0")}
+            for cpu, (package, core) in layout.items():
+                topology = sysfs / f"cpu{cpu}" / "topology"
+                topology.mkdir(parents=True)
+                (topology / "physical_package_id").write_text(package + "\n")
+                (topology / "core_id").write_text(core + "\n")
+            with mock.patch.object(os, "sched_getaffinity", return_value={0, 1, 2, 3, 4, 5}):
+                self.assertEqual(runtime.physical_cores(sysfs), 3)   # two hyperthreaded cores and one more package
+            with mock.patch.object(os, "sched_getaffinity", return_value={0, 2}):
+                self.assertEqual(runtime.physical_cores(sysfs), 1)   # only what this process may run on
+            with mock.patch.object(os, "sched_getaffinity", return_value={0, 9}):
+                self.assertIsNone(runtime.physical_cores(sysfs))     # topology not readable: do not guess
+
+    def test_scope_carries_the_limits(self):
+        cfg = gvisor_cfg()
+        cfg.runtime.memory, cfg.runtime.pids_limit, cfg.runtime.cpus = "3g", 100, 1.5
+        with mock.patch.object(runtime.shutil, "which", return_value="/usr/bin/systemd-run"):
+            args = runtime.scoped(cfg, ["podman", "run"])
+            self.assertEqual(args[:3], ["systemd-run", "--user", "--scope"])
+            self.assertEqual(args[-2:], ["podman", "run"])
+            for prop in (f"MemoryMax={3 << 30}", "MemorySwapMax=0", "TasksMax=712", "CPUQuota=150%"):
+                self.assertIn(prop, args)
+            self.assertIn(f"MemoryMax={512 << 20}", runtime.scoped(cfg, ["podman"], memory="512m"))
+        self.assertEqual(runtime.scoped(cfg_with(), ["podman", "run"]), ["podman", "run"])  # host kernel: no scope
+
+    def test_no_scope_means_no_launch(self):
+        with mock.patch.object(runtime.shutil, "which", return_value=None), self.assertRaises(runtime.LaunchError):
+            runtime.scoped(gvisor_cfg(), ["podman", "run"])
+
+
+class GvisorSocketDirTests(unittest.TestCase):
+    """On gVisor one directory is shared for the runtime's socket; it is locked once the socket exists."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = gvisor_cfg()
+        runtime.prepare_run_dir(self.cfg)
+        self.cfg.gvisor_socket_dir.mkdir(mode=0o700)
+        os.chmod(self.cfg.gvisor_socket_dir, 0o777)
+
+    def bind(self, name="llama.sock"):
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.cfg.gvisor_socket_dir / name))
+        self.addCleanup(listener.close)
+
+    def lock(self):
+        lock = runtime.GvisorSocketLock(self.cfg, time.monotonic() + 5)
+        lock.start()
+        return lock
+
+    def test_locks_as_soon_as_the_socket_appears(self):
+        lock = self.lock()
+        time.sleep(0.05)
+        self.assertFalse(lock.locked.is_set())
+        self.assertFalse(runtime.runtime_reachable(self.cfg))  # an open directory is not a usable one
+        self.bind()
+        self.assertTrue(lock.locked.wait(2))
+        self.assertIsNone(lock.error)
+        self.assertEqual(oct(os.stat(self.cfg.gvisor_socket_dir).st_mode & 0o777), "0o755")
+        self.assertTrue(runtime.runtime_reachable(self.cfg))
+
+    def test_anything_but_the_socket_fails_the_launch(self):
+        for plant in ("file", "symlink", "extra"):
+            with self.subTest(plant=plant):
+                directory = self.cfg.gvisor_socket_dir
+                os.chmod(directory, 0o777)
+                for entry in directory.iterdir():
+                    entry.unlink()
+                lock = self.lock()
+                if plant == "file":
+                    (directory / "llama.sock").write_text("not a socket")
+                elif plant == "symlink":
+                    os.symlink("/run/user/1000/bus", directory / "llama.sock")
+                else:
+                    (directory / "dropped").write_text("x")
+                self.assertTrue(lock.locked.wait(2))
+                self.assertIsInstance(lock.error, runtime.LaunchError)
+                self.assertIn("unexpected content", str(lock.error))
+                self.assertFalse(runtime.runtime_reachable(self.cfg))
+
+    def test_gives_up_at_the_deadline(self):
+        lock = runtime.GvisorSocketLock(self.cfg, time.monotonic() + 0.05)
+        lock.start()
+        lock.join(2)
+        self.assertFalse(lock.is_alive())
+        self.assertFalse(lock.locked.is_set())
+
+    def test_health_goes_through_the_locked_socket_only(self):
+        self.assertIsNone(runtime.health(self.cfg))            # nothing bound
+        self.bind()
+        self.assertIsNone(runtime.health(self.cfg, timeout=1))  # bound, but the directory is still open
+
+
+class RunDirTests(unittest.TestCase):
+    """The host-side directory for the connector's control socket, never shared with a sandbox."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -74,91 +221,23 @@ class SocketDirTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.addCleanup(self.tmp.cleanup)
         self.cfg = Config(name="t")
-        self.listener = None
-
-    def bind(self):
-        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.listener.bind(str(self.cfg.socket_path))
-        self.addCleanup(self.listener.close)
 
     def mode(self, path):
         return oct(os.stat(path).st_mode & 0o777)
 
-    def test_prepare_then_lock(self):
-        d = runtime.prepare_socket_dir(self.cfg)
+    def test_prepare(self):
+        d = runtime.prepare_run_dir(self.cfg)
         self.assertEqual(d, Path(self.tmp.name) / "silo" / "t")
         self.assertEqual(self.mode(d.parent), "0o700")  # no other host user gets near it
-        self.assertEqual(self.mode(d), "0o777")         # the sandbox UID has to be able to bind
-        self.assertFalse(runtime.socket_dir_locked(self.cfg))
-        self.bind()
-        runtime.lock_socket_dir(self.cfg)
-        self.assertEqual(self.mode(d), "0o755")         # ...and nothing after that
-        self.assertTrue(runtime.socket_dir_locked(self.cfg))
+        self.assertEqual(self.mode(d), "0o700")
+        self.assertEqual(self.cfg.control_path.parent, d)
 
     def test_prepare_discards_whatever_was_there(self):
-        d = runtime.prepare_socket_dir(self.cfg)
-        (d / "leftover").write_text("x")
-        (d / runtime.SOCKET_NAME).symlink_to("/run/user/0/bus")
-        d = runtime.prepare_socket_dir(self.cfg)
+        d = runtime.prepare_run_dir(self.cfg)
+        (d / "stale").write_text("x")
+        os.symlink("/etc/passwd", d / "control.sock")
+        d = runtime.prepare_run_dir(self.cfg)
         self.assertEqual(os.listdir(d), [])
-
-    def test_lock_refuses_a_symlink_at_the_socket_path(self):
-        d = runtime.prepare_socket_dir(self.cfg)
-        other = Path(self.tmp.name) / "other.sock"
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.bind(str(other))
-        self.addCleanup(s.close)
-        (d / runtime.SOCKET_NAME).symlink_to(other)  # points at a real socket: only lstat tells them apart
-        with self.assertRaises(runtime.LaunchError):
-            runtime.lock_socket_dir(self.cfg)
-        self.assertFalse(runtime.socket_dir_locked(self.cfg))
-
-    def test_lock_refuses_extra_entries(self):
-        d = runtime.prepare_socket_dir(self.cfg)
-        self.bind()
-        (d / "extra").write_text("x")
-        with self.assertRaises(runtime.LaunchError):
-            runtime.lock_socket_dir(self.cfg)
-
-    def watch(self):
-        watcher = runtime.SocketDirWatcher(self.cfg, time.monotonic() + 5)
-        watcher.start()
-        self.addCleanup(watcher.cancel)
-        return watcher
-
-    def test_watcher_locks_as_soon_as_the_socket_appears(self):
-        d = runtime.prepare_socket_dir(self.cfg)
-        watcher = self.watch()
-        time.sleep(0.05)
-        self.assertFalse(watcher.locked.is_set())  # nothing there yet, nothing locked
-        self.assertEqual(self.mode(d), "0o777")
-        self.bind()
-        self.assertTrue(watcher.locked.wait(2))
-        self.assertIsNone(watcher.error)
-        self.assertEqual(self.mode(d), "0o755")
-        bound, locked = os.lstat(self.cfg.socket_path).st_ctime_ns, os.lstat(d).st_ctime_ns
-        self.assertLess((locked - bound) / 1e6, 250)  # generous for a loaded CI box; ~1 ms in practice
-
-    def test_watcher_fails_the_launch_if_anything_else_shows_up(self):
-        for plant in ("file", "symlink"):
-            with self.subTest(plant=plant):
-                d = runtime.prepare_socket_dir(self.cfg)
-                watcher = self.watch()
-                if plant == "file":
-                    (d / "dropped").write_text("x")
-                else:
-                    (d / runtime.SOCKET_NAME).symlink_to("/run/user/0/bus")
-                self.assertTrue(watcher.locked.wait(2))
-                self.assertIsInstance(watcher.error, runtime.LaunchError)
-                self.assertEqual(self.mode(d), "0o755")  # locked regardless, so nothing more can be added
-
-    def test_watcher_can_be_cancelled(self):
-        runtime.prepare_socket_dir(self.cfg)
-        watcher = self.watch()
-        watcher.cancel()
-        watcher.join(2)
-        self.assertFalse(watcher.is_alive())
-        self.assertFalse(watcher.locked.is_set())
 
     def test_remove_dir_only_touches_silo_runtime_dirs(self):
         victim = Path(self.tmp.name) / "victim"
@@ -169,11 +248,125 @@ class SocketDirTests(unittest.TestCase):
                 runtime._remove_dir(path)
         self.assertTrue((victim / "keep").exists())
 
-    def test_health_of_a_missing_or_fake_socket_is_none(self):
-        runtime.prepare_socket_dir(self.cfg)
-        self.assertIsNone(runtime.health(self.cfg.socket_path))
-        self.cfg.socket_path.write_text("not a socket")
-        self.assertIsNone(runtime.health(self.cfg.socket_path))
+    def test_health_of_a_missing_or_fake_control_socket_is_none(self):
+        runtime.prepare_run_dir(self.cfg)
+        self.assertIsNone(runtime.health(self.cfg))
+        self.cfg.control_path.write_text("not a socket")
+        self.assertIsNone(runtime.health(self.cfg))
+
+    def test_connector_state(self):
+        runtime.prepare_run_dir(self.cfg)
+        self.assertIsNone(runtime.connector_pid(self.cfg))
+        self.assertFalse(runtime.runtime_reachable(self.cfg))
+        # a live process that was not started with this pidfile is not the connector (a stale
+        # pidfile whose PID was reused), and must never be signalled as one
+        self.cfg.connector_pidfile.write_text(f"{os.getpid()}\n")
+        self.assertIsNone(runtime.connector_pid(self.cfg))
+        with mock.patch.object(runtime, "run") as run:
+            runtime.stop_connector(self.cfg)
+        run.assert_not_called()
+        helper = stand_in_helper(self, self.cfg.connector_pidfile)
+        self.cfg.connector_pidfile.write_text(f"{helper.pid}\n")
+        self.assertEqual(runtime.connector_pid(self.cfg), helper.pid)
+        self.assertFalse(runtime.runtime_reachable(self.cfg))  # no control socket yet
+        for junk in ("", "abc", "1", "-5"):
+            self.cfg.connector_pidfile.write_text(junk)
+            self.assertIsNone(runtime.connector_pid(self.cfg))
+
+    def test_connector_script_is_packaged_and_standalone(self):
+        script = runtime.connector_script()
+        compile(script, "connector.py", "exec")
+        self.assertFalse(any(line.startswith(("from silo", "import silo")) for line in script.splitlines()))  # runs from source under `podman unshare`, outside the package
+
+
+class ExecLockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.tmp.name, "XDG_STATE_HOME": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_where_the_lock_applies(self):
+        cfg = cfg_with()
+        self.assertTrue(runtime.exec_lock(cfg))                 # on by default
+        cfg.runtime.exec_lock = False
+        self.assertFalse(runtime.exec_lock(cfg))
+        gv = gvisor_cfg()
+        self.assertTrue(gv.runtime.exec_lock)
+        self.assertFalse(runtime.exec_lock(gv))                 # gVisor has no seccomp user notification
+
+    def test_profile_names_the_supervisor_of_this_sandbox(self):
+        base = Path(self.tmp.name) / "base.json"
+        base.write_text('{"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [{"names": ["read", "execve"], '
+                        '"action": "SCMP_ACT_ALLOW"}]}')
+        cfg = cfg_with()
+        cfg.runtime.seccomp_base = base
+        import json
+        model = json.loads(runtime.prepare_seccomp(cfg, exec_dir=cfg.socket_dir).read_text())
+        self.assertEqual(model["listenerPath"], str(cfg.socket_dir / "exec.sock"))
+        scratch = Path(self.tmp.name) / "silo" / "probe-abc"
+        probe = json.loads(runtime.prepare_seccomp(cfg, exec_dir=scratch, probe=True).read_text())
+        self.assertEqual(probe["listenerPath"], str(scratch / "exec.sock"))
+        # a probe run must not rewrite the profile a running model was started with
+        self.assertNotEqual(cfg.seccomp_path, cfg.probe_seccomp_path)
+        self.assertEqual(json.loads(cfg.seccomp_path.read_text())["listenerPath"], model["listenerPath"])
+        self.assertNotIn("listenerPath", json.loads(runtime.prepare_seccomp(cfg).read_text()))
+
+    def test_refusals_are_counted_from_the_supervisor_log(self):
+        directory = Path(self.tmp.name)
+        self.assertEqual(runtime.execs_refused(directory), 0)  # no log: nothing refused
+        (directory / runtime.EXEC_LOG).write_text(
+            "execlock: ready, pid 10\nexeclock: supervising, container pid 11, uid 65532, errno mode (no capabilities)\n"
+            "execlock: execve #2 by pid 12 (syscall 59): refused (EPERM)\n"
+            "execlock: execve #3 by pid 12 (syscall 322): refused (EPERM)\n")
+        self.assertEqual(runtime.execs_refused(directory), 2)
+
+    def test_state_shown_by_status(self):
+        cfg = cfg_with()
+        self.assertEqual(runtime.exec_lock_state(cfg), "on (supervisor not running)")
+        cfg.socket_dir.mkdir(parents=True)
+        pidfile = cfg.socket_dir / runtime.EXEC_PIDFILE
+        pidfile.write_text(f"{os.getpid()}\n")  # some live process, not the supervisor
+        self.assertEqual(runtime.exec_lock_state(cfg), "on (supervisor not running)")
+        helper = stand_in_helper(self, pidfile)
+        pidfile.write_text(f"{helper.pid}\n")
+        self.assertEqual(runtime.exec_lock_state(cfg), "on")
+        cfg.runtime.exec_lock = False
+        self.assertIn("off", runtime.exec_lock_state(cfg))
+        self.assertIn("gVisor", runtime.exec_lock_state(gvisor_cfg()))
+
+    def test_supervisor_script_is_packaged_and_standalone(self):
+        script = runtime.execlock_script()
+        compile(script, "execlock.py", "exec")
+        self.assertFalse(any(line.startswith(("from silo", "import silo")) for line in script.splitlines()))
+
+    def test_exit_hint_names_the_lock(self):
+        cfg = cfg_with()
+        cfg.socket_dir.mkdir(parents=True)
+        (cfg.socket_dir / runtime.EXEC_LOG).write_text("execlock: execve #2 by pid 12 (syscall 59): killed\n")
+        inspect = mock.Mock(stdout="137 false\n")
+        with mock.patch.object(runtime, "run", return_value=inspect):
+            self.assertIn("killed by silo's exec lock", runtime._exit_hint(cfg))
+            inspect.stdout = "126 false\n"
+            self.assertIn("exec lock refused an execve", runtime._exit_hint(cfg))
+            self.assertIn("runtime.exec_lock = false", runtime._exit_hint(cfg))
+            (cfg.socket_dir / runtime.EXEC_LOG).write_text("execlock: ready, pid 10\n")
+            self.assertEqual(runtime._exit_hint(cfg), "exit code 126")   # nothing refused: not the lock's doing
+
+
+class EarlyExitTests(unittest.TestCase):
+    def test_a_runtime_that_died_is_reported_with_its_reason(self):
+        cfg = Config(name="t")
+        with mock.patch.object(runtime, "container_running", return_value=False), \
+                mock.patch.object(runtime, "_exit_hint", return_value="exit code 1"), \
+                mock.patch.object(runtime, "_tail_logs", return_value="error: invalid argument: --x"):
+            with self.assertRaises(runtime.LaunchError) as cm:
+                runtime._raise_if_exited(cfg)
+        self.assertIn("exited during startup (exit code 1)", str(cm.exception))
+        self.assertIn("invalid argument: --x", str(cm.exception))
+        with mock.patch.object(runtime, "container_running", return_value=True):
+            runtime._raise_if_exited(cfg)  # still running: nothing to report
 
 
 if __name__ == "__main__":

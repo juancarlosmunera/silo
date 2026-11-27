@@ -28,9 +28,11 @@ What has to be correct for the above to hold:
 
 - the host kernel (namespaces, seccomp, cgroups, SELinux enforcement);
 - Podman, crun and conmon, and the SELinux container policy;
-- silo's launcher and gateway: about 1,400 lines of Python (`sandbox.py`, `seccomp.py`, `runtime.py`,
-  `gateway.py`), standard library only;
+- silo's launcher, connector, exec supervisor and gateway: about 2,100 lines of Python (`sandbox.py`,
+  `seccomp.py`, `runtime.py`, `connector.py`, `execlock.py`, `gateway.py`), standard library only;
 - the base seccomp profile shipped by the distribution, which silo tightens but does not replace;
+- with `runtime.runsc`: gVisor (`runsc`, its sentry and its gofer), which then stands where the host
+  kernel's system call interface stood, and without SELinux around it;
 - `silo.toml`, which chooses the image, the model directory and the seccomp base. It is read only
   from an explicit path or the user's configuration directory, never from the current directory,
   and silo prints which file it used whenever it launches something.
@@ -70,6 +72,16 @@ for each entry.
 - **Exploitation primitives:** SysV and POSIX message queues, `splice`/`vmsplice`/`tee`, legacy
   AIO, `remap_file_pages`. Legitimate elsewhere, useless to llama-server, and the standard tools for
   turning a kernel bug into a working exploit.
+- **Argument allowlists (CPU-only sandboxes):** `ioctl`, `prctl` and `setsockopt` are allowed only
+  with the values an inference server uses, measured by tracing llama-server through startup,
+  model loading, buffered and streamed completions, tool calls, embeddings and concurrent requests,
+  plus the two `prctl` operations crun performs while dropping capabilities and a few read-only or
+  self-directed ones. Everything else is denied: driver-specific ioctls, `PR_SET_MM`, `PR_SET_VMA`,
+  syscall user dispatch, and classic BPF socket filters (`SO_ATTACH_FILTER`), which would otherwise
+  reach the BPF interpreter without `bpf()`. Each allowlist is written as allow rules for the exact
+  values plus deny rules that cover every other 64-bit value, and a unit test checks that the two
+  never overlap and leave nothing out. Verified by `args.*`. GPU drivers issue device ioctls that
+  cannot be listed in advance, so with GPU passthrough the stock rules for these three apply.
 - **The TTY layer:** `/dev/pts` is masked, so no pty can be allocated; line-discipline autoloading
   and `TIOCSTI` have nothing to act on.
 - **Kernel layout:** `/proc/kallsyms`, `/proc/modules`, `/proc/cmdline`, `/sys/module` and
@@ -99,20 +111,60 @@ emptied. Verified by `fs.*`, `proc.environment`, `host.secrets`.
 `noexec` raises the cost of running a dropped binary; it does not stop code execution inside an
 already compromised process, which can still map executable memory.
 
-### The socket directory
+### Running other programs
 
-The runtime has to create a UNIX socket that the gateway can reach, so one host directory is
-shared with the sandbox. It sits inside a 0700 directory in `$XDG_RUNTIME_DIR` and starts out
-writable for the sandbox UID. A watcher thread, started before the container, makes it read-only
-for that UID as soon as anything appears in it, and then checks that it holds exactly one entry, a
-socket (by `lstat`, so a symlink to some other host socket is refused). Anything else aborts the
-launch. silo does not connect to the socket before that check has passed, and the gateway repeats
-the `lstat` check on every connection. Verified by `fs.socket_dir_locked`.
+The runtime image is not empty. llama.cpp's ships a shell, `curl` and a Python interpreter, and a
+runtime that has been taken over could run any of them, or something it carried in. `noexec` only
+covers the one place a new file could be written.
 
-The lock cannot land before model loading: llama-server binds and goes straight on to read the
-model file. Measured from inode timestamps on the development machine it lands about a millisecond
-after the bind, which is the resolution of those timestamps. See the startup window under residual
-risk.
+Once the runtime has started, nothing else can be executed. A seccomp filter cannot express that
+by itself: it is fixed before the container's entrypoint is executed, and would have to count. So
+silo's profile hands `execve` and `execveat` to a supervisor on the host (`silo/execlock.py`)
+through seccomp's user notification: the kernel suspends the caller and asks. The container
+runtime passes the supervisor the notification descriptor together with the PID of the
+container's first process, and the supervisor:
+
+- lets exactly one call continue: the first, and only if that process makes it. That is the
+  runtime executing the image's entrypoint, before any code from the image has run;
+- refuses every later one with `EPERM`, or with `seccomp_action = "kill"` kills the process that
+  made it, as a seccomp kill would;
+- writes each refusal to the audit log (`"event": "exec_refused"`): the first hundred one by one, then one
+  line per ten thousand with the running count, so that a sandbox looping on execve cannot fill the disk.
+
+The decision depends only on which call it is, never on its arguments, so the known weakness of
+continuing a notified system call (the caller can change the arguments after they were looked at)
+has nothing to act on. If the supervisor dies, the kernel answers every `execve` with `ENOSYS`: the
+lock fails closed. The supervisor runs as an unprivileged UID of the user namespace with no
+capabilities, or with `CAP_KILL` alone in kill mode. Once it holds the descriptor it removes its
+socket, so `podman exec` into the sandbox is refused by the container runtime as well.
+
+What it does not do: code already running inside the runtime can still do whatever the runtime
+could, in its own process. The lock takes away the tools around it, and in kill mode turns the
+most common second step of an exploit, starting a shell, into the runtime's death.
+
+Verified by `proc.exec_locked`, and by a unit test that runs the supervisor against a real
+notification descriptor. It is on by default; `runtime.exec_lock = false` is for an image whose
+entrypoint is a wrapper that starts the real server, which needs a second `execve`. On GPU
+sandboxes, where `memfd_create` has to stay allowed, the lock is also what stops fileless
+execution (`fs.memfd_exec`). It is not available on gVisor, which has no user notification.
+
+### The runtime's socket
+
+The gateway has to reach the runtime, but no host directory is shared with the sandbox for it.
+llama-server listens on an abstract UNIX socket. Abstract sockets belong to a network namespace,
+not to the filesystem, so this one exists only inside the sandbox's `--network=none` namespace:
+no host process can see it, and the sandbox gets nothing on the host to write to.
+
+To reach it, silo starts a connector (`silo/connector.py`, about 170 lines, standard library) under
+`podman unshare`, as root of the rootless user namespace that owns the container's namespaces. It
+binds a control socket (0600, in the 0700 runtime directory in `$XDG_RUNTIME_DIR`), joins the
+container's network namespace after checking it is not its own, and drops to an unprivileged UID of
+the user namespace, which leaves it with no capabilities. From then on it only does this, on
+request: connect to the runtime's abstract socket and pass the connected socket to the gateway over
+the control socket. It never reads what the runtime sends, and it exits when the container's
+process does. The gateway checks that the control socket is a socket owned by the user (`lstat`, so
+not a symlink) and, on every connection, that the peer is the sandbox's host UID (`SO_PEERCRED`).
+Verified by `fs.no_shared_dir`; the connector's state is shown by `silo status`.
 
 ### Model files
 
@@ -146,31 +198,66 @@ Described in the README. The properties that matter here:
 - Text from a sandbox, a model file or a model directory is escaped before silo prints it, so
   GGUF metadata, file names and runtime logs cannot drive the operator's terminal.
 
+### On gVisor (optional)
+
+With `runtime.runsc` the same sandbox is started on gVisor's user-space kernel
+(`docs/GVISOR.md`). What changes in the routes above:
+
+- **Kernel.** The runtime's system calls are served by gVisor's sentry. The host kernel sees only
+  the sentry's own calls, behind gVisor's seccomp filter. silo's seccomp profile is still applied
+  to the runtime, by gVisor.
+- **Privilege.** silo turns gVisor's `directfs` off, so the sentry runs as the sandbox's
+  subordinate UID with no capabilities and an empty bounding set, in a user namespace that maps
+  that one UID, and reaches files only through the gofer. The gofer runs as the invoking user in a
+  user namespace, with a seccomp filter; the container's root and the model directory are mounted
+  read-only for it.
+- **SELinux** does not confine the sandbox: `runsc` refuses SELinux labels, and its processes run
+  in the container runtime's domain.
+- **The runtime's socket.** An abstract socket would stay inside gVisor's kernel, so one host
+  directory is shared for the socket. silo locks it (owned by the user, writable by nobody else)
+  as soon as the socket appears, fails the launch if anything else is in it, and the gateway checks
+  the lock, the socket and the listener's UID on every connection.
+- **Running other programs.** The exec lock is not available: gVisor's seccomp has no user
+  notification and refuses a profile that asks for it. Programs in the image can be executed
+  inside the sandbox, on gVisor's kernel.
+- **Resources.** Rootless `runsc` cannot set up cgroups. silo starts Podman inside a systemd user
+  scope that carries the memory, swap, task and CPU limits for the whole gVisor sandbox, and
+  refuses to start without one.
+
+Verified by the same probes, with `kernel.gvisor`, `fs.socket_dir_locked` and `fs.no_shared_dir`
+(the socket directory must be the only writable host mount) in addition.
+
 ## Residual risk
 
 Stated plainly, in rough order of importance.
 
-1. **Kernel vulnerabilities.** About 320 syscalls remain reachable, among them `ioctl`, `prctl`,
-   `mmap`, `execve` and the socket calls for `AF_UNIX`. A bug behind any of them is a way out, and
+1. **Kernel vulnerabilities.** About 320 syscalls remain reachable, among them `mmap`, `execve`, the
+   socket calls for `AF_UNIX`, and the allowlisted values of `ioctl`, `prctl` and `setsockopt`.
+   With GPU passthrough those three are not argument-filtered at all. A bug behind any of them is a way out, and
    SELinux and the user namespace are then the only things left. Use `seccomp_action = "kill"` so a
    probing exploit dies on its first denied call, keep the kernel patched, and apply the host
-   sysctls. The real fix is a second boundary around the kernel. silo offers two, both outside the
-   sandbox itself: a local VM with no network device (`docs/LOCAL_VM.md`), and a dedicated server
-   that holds nothing and cannot start a connection (`docs/VPS.md`). Without one of them, the
-   host kernel is the only thing between a compromised runtime and your account.
+   sysctls. The real fix is a second boundary around the kernel. silo offers three: gVisor's
+   user-space kernel in place of the host's (`docs/GVISOR.md`), a local VM with no network device
+   (`docs/LOCAL_VM.md`), and a dedicated server that holds nothing and cannot start a connection
+   (`docs/VPS.md`). Without one of them, the host kernel is the only thing between a compromised
+   runtime and your account.
 2. **The person reading the output.** A contained model can still write "run this". The tripwire
    recognises common shapes and can be evaded by any model capable enough to matter. Treat output
    as untrusted input, especially commands.
 3. **The client.** A chat UI that renders markdown will fetch a remote image by itself, with data
    in the URL. An agent harness will execute tool calls. Both act with the client's network access,
    not the model's. Tool calling is off by default for this reason; if you turn it on, whatever
-   executes the calls is the boundary and needs its own sandbox.
+   executes the calls is the boundary and needs its own sandbox. `gateway.tools` limits which tools
+   can be offered and the model can only call what was offered, but the gateway does not judge a
+   call's arguments beyond size and the output tripwire.
 4. **Local processes.** The gateway listens on loopback, which every process and user on the
    machine can reach. Set `api_key_env` if that matters. The model socket itself is reachable only
    by your user.
 5. **GPU passthrough.** A GPU driver is a large, privileged kernel interface handed to the
-   sandbox, and `memfd_create` stays allowed for it. The code path exists and has not been run on
-   real hardware. For a model you do not trust, use the CPU.
+   sandbox, and `memfd_create` stays allowed for it. With `dri` or `amd`, only the render nodes
+   are passed: the display nodes (`/dev/dri/card*`), which carry modesetting, never are. Verified
+   on an Intel Iris Xe GPU with llama.cpp's Vulkan image in kill mode: the Vulkan driver needed no
+   syscall silo denies. NVIDIA and AMD are not verified. For a model you do not trust, use the CPU.
 6. **Covert channels.** Timing, CPU load and memory pressure can carry bits to a cooperating
    process outside. Containers do not address this and neither does silo.
 7. **Information visible inside.** Kernel version, CPU details, memory size and the host path of
@@ -180,13 +267,13 @@ Stated plainly, in rough order of importance.
    the sandbox process is not confined by any mandatory access control. Everything else is in
    place there, but the layer that limits what a process can touch once it is past the others is
    missing. `silo doctor` fails such a host and `silo probe` reports it.
-10. **The startup window.** From container start until about a millisecond after the socket is
-   bound, the socket directory is writable by the sandbox UID. Model loading begins right after the
-   bind, so its first instants fall inside that window. A model file that exploits the loader that
-   quickly could write there: what it leaves behind fails the launch, but a brief fill of the
-   runtime tmpfs is possible. The fix is not to share a directory at all.
-11. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
+10. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
     delivered. Only `enforce` withholds.
+11. **gVisor sandboxes.** They exchange one layer for another. SELinux does not confine them and
+    the exec lock is not available. The socket directory is shared, and writable from inside from container start until the runtime
+    has bound its socket: a model file that took over the runtime that early could put files there,
+    which fails the launch but could fill the runtime directory for a moment. And gVisor's own
+    kernel, with its bugs, is now in the path.
 
 ## Not goals
 
@@ -197,11 +284,5 @@ Stated plainly, in rough order of importance.
 
 ## Roadmap
 
-- gVisor (`runsc`) as the sandbox runtime: a second kernel boundary without a whole VM.
 - Mandatory access control for the sandbox on AppArmor hosts.
-- Handing the runtime's socket to the gateway without a shared host directory.
-- Argument-level allowlists for `ioctl`, `setsockopt` and `prctl`.
-- Locking down `execve` after the runtime has started.
-- An origin allowlist with proper CORS handling, for browser-based clients.
-- Tool-call mediation: per-tool policy instead of all-or-nothing.
-- The probe suite as a CI gate, and verification on GPU hardware and aarch64.
+- Verification on NVIDIA and AMD GPUs.

@@ -25,9 +25,26 @@ EXTRA_MASKED_PATHS = ("/proc/kallsyms", "/proc/modules", "/proc/cmdline", "/sys/
 GPU_DEVICES = {
     "none": (),
     "nvidia": ("nvidia.com/gpu=all",),  # CDI; requires nvidia-container-toolkit CDI spec
-    "amd": ("/dev/kfd", "/dev/dri"),
-    "dri": ("/dev/dri",),  # Vulkan / Intel
+    "amd": ("/dev/kfd",),  # plus the render nodes (ROCm)
+    "dri": (),  # the render nodes only (Vulkan: Intel, AMD, ...)
 }
+DRI_DIR = Path("/dev/dri")
+
+
+def gpu_devices(gpu: str, dri_dir: Path = DRI_DIR) -> tuple[str, ...]:
+    """Device nodes for a GPU mode.
+
+    For DRM GPUs only the render nodes (/dev/dri/renderD*) are passed: they are all compute needs.
+    The primary nodes (/dev/dri/card*) carry modesetting and display control, a larger and more
+    privileged driver interface, and are never handed to a sandbox.
+    """
+    devices = GPU_DEVICES[gpu]
+    if gpu in ("amd", "dri"):
+        render = sorted(str(p) for p in dri_dir.glob("renderD*"))
+        if not render:
+            raise HardeningError(f"runtime.gpu = {gpu!r} but there is no render node in {dri_dir}")
+        devices = devices + tuple(render)
+    return devices
 
 # Flags that must appear in every silo container.
 REQUIRED_FLAGS = (
@@ -75,6 +92,36 @@ FORBIDDEN_PREFIXES = (
 )
 
 
+# Global podman flags for a sandbox on gVisor (runtime.runsc).
+#   ignore-cgroups, cgroup-manager=cgroupfs: rootless runsc cannot manage cgroups, so the launcher wraps
+#       podman in a systemd user scope that carries the memory and task limits instead (gvisor_scope).
+#   network=none: no network stack beyond loopback inside gVisor either.
+#   directfs=false: gVisor's sentry, the process sandboxed code attacks, then runs as the sandbox's own
+#       unprivileged subordinate UID with no capabilities, and reaches files only through the gofer.
+#       With gVisor's default (directfs on) it would run as the invoking user with DAC-override
+#       capabilities in a user namespace.
+#   host-uds=create: the runtime may create its listening socket in the one directory silo mounts for
+#       it. It may not connect to any host socket.
+# runsc does not accept SELinux process labels, so the container is started with label=disable:
+# under gVisor the user-space kernel is the confinement layer, and SELinux does not confine it.
+GVISOR_RUNTIME_FLAGS = ("--runtime-flag=ignore-cgroups", "--runtime-flag=network=none",
+                        "--runtime-flag=directfs=false", "--runtime-flag=host-uds=create",
+                        "--cgroup-manager=cgroupfs")
+GVISOR_ONLY = "--security-opt=label=disable"
+
+
+def gvisor_globals(rt) -> list[str]:
+    """Global podman flags for a sandbox on gVisor; empty without runtime.runsc.
+
+    The platform is always named, so the sandbox does not change with runsc's default: systrap
+    intercepts syscalls with seccomp and works everywhere, VMs included; kvm runs the workload in a
+    hardware-virtualised guest, is faster, and hands /dev/kvm to gVisor's sentry.
+    """
+    if rt.runsc is None:
+        return []
+    return [f"--runtime={rt.runsc}", *GVISOR_RUNTIME_FLAGS, f"--runtime-flag=platform={rt.gvisor_platform}"]
+
+
 class HardeningError(RuntimeError):
     pass
 
@@ -115,8 +162,11 @@ def podman_run_args(
 ) -> list[str]:
     rt = cfg.runtime
     memory = memory or rt.memory
+    gvisor = rt.runsc is not None
     args = [
-        "podman", "run",
+        "podman",
+        *gvisor_globals(rt),
+        "run",
         *(["--rm"] if remove else []),
         f"--name={name}",
         f"--label={LABEL}",
@@ -158,9 +208,11 @@ def podman_run_args(
         "--pull=never",
         "--stop-timeout=10",
     ]
+    if gvisor:
+        args.append(GVISOR_ONLY)
     if rt.cpus:
         args.append(f"--cpus={rt.cpus}")
-    for device in GPU_DEVICES[gpu]:
+    for device in gpu_devices(gpu):
         args.append(f"--device={device}")
     for mount in mounts:
         args.append(mount.flag())
@@ -170,22 +222,44 @@ def podman_run_args(
         args.append("--interactive")
     args.append(image)
     args.extend(command)
-    assert_hardened(args, gpu=gpu)
+    assert_hardened(args, gpu=gpu, gvisor=gvisor_globals(rt))
     return args
 
 
-def assert_hardened(args: list[str], gpu: str = "none") -> None:
+def gvisor_scope(memory_bytes: int, tasks: int, cpus: float | None = None) -> list[str]:
+    """systemd-run prefix that puts podman, conmon and the gVisor sandbox under one limited scope.
+
+    The limits therefore cover gVisor's own processes as well as the workload: nothing started for
+    this sandbox can use more than runtime.memory, swap, more tasks than the cap, or more CPU time
+    than runtime.cpus.
+    """
+    scope = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "-p", "Delegate=yes",
+             "-p", f"MemoryMax={memory_bytes}", "-p", "MemorySwapMax=0", "-p", f"TasksMax={tasks}"]
+    if cpus:
+        scope += ["-p", f"CPUQuota={round(cpus * 100)}%"]
+    return scope
+
+
+def assert_hardened(args: list[str], gpu: str = "none", gvisor: list[str] = ()) -> None:
+    """Check a podman command line before it runs. `gvisor` is gvisor_globals() for the sandbox."""
+    if args[:1] != ["podman"] or "run" not in args:
+        raise HardeningError("not a podman run command")
+    run_idx = args.index("run")
+    if args[1:run_idx] != list(gvisor):
+        raise HardeningError(f"unexpected global podman flags: {args[1:run_idx]}")
     try:
-        image_idx = next(i for i, a in enumerate(args) if i > 1 and not a.startswith("-"))
+        image_idx = next(i for i, a in enumerate(args) if i > run_idx and not a.startswith("-"))
     except StopIteration:
         raise HardeningError("no image in podman args")
-    opts = args[2:image_idx]
+    opts = args[run_idx + 1:image_idx]
     missing = [f for f in REQUIRED_FLAGS if f not in opts]
     if missing:
         raise HardeningError(f"missing required flags: {missing}")
     if not any(o.startswith("--security-opt=seccomp=") and not o.endswith("=unconfined") for o in opts):
         raise HardeningError("no custom seccomp profile")
     for opt in opts:
+        if opt == GVISOR_ONLY and gvisor:
+            continue
         for bad in FORBIDDEN_PREFIXES:
             if opt == bad or opt.startswith(bad + "=") or (bad.endswith(("=", ":")) and opt.startswith(bad)):
                 raise HardeningError(f"forbidden flag: {opt}")
