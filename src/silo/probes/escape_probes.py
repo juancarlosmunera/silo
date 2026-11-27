@@ -48,14 +48,14 @@ SYSNR = {
         "perf_event_open": 298, "open_by_handle_at": 304, "setns": 308, "process_vm_readv": 310,
         "bpf": 321, "userfaultfd": 323, "socketpair": 53, "msgget": 68, "io_setup": 206,
         "remap_file_pages": 216, "mq_open": 240, "splice": 275, "vmsplice": 278,
-        "ioctl": 16, "prctl": 157, "setsockopt": 54,
+        "ioctl": 16, "prctl": 157, "setsockopt": 54, "clone": 56, "sendfile": 40, "seccomp": 317,
     },
     "aarch64": {
         "socket": 198, "ptrace": 117, "mount": 40, "keyctl": 219, "add_key": 217, "unshare": 97,
         "perf_event_open": 241, "open_by_handle_at": 265, "setns": 268, "process_vm_readv": 270,
         "bpf": 280, "userfaultfd": 282, "socketpair": 199, "msgget": 186, "io_setup": 0,
         "remap_file_pages": 234, "mq_open": 180, "splice": 76, "vmsplice": 75,
-        "ioctl": 29, "prctl": 167, "setsockopt": 208,
+        "ioctl": 29, "prctl": 167, "setsockopt": 208, "clone": 220, "sendfile": 71, "seccomp": 277,
     },
 }
 # Unified numbering for syscalls added after 5.1 (same on every architecture).
@@ -273,7 +273,7 @@ def probe_syscalls():
         ("pidfd_getfd", (-1, 0, 0), "pidfd_getfd"),
         ("bpf", (0, 0, 0), "bpf"),
         ("perf_event_open", (0, 0, -1, -1, 0), "perf_event_open"),
-        ("userfaultfd", (0,), "userfaultfd"),
+        ("userfaultfd", (1,), "userfaultfd(UFFD_USER_MODE_ONLY), which needs no privilege"),
         ("keyctl", (0, -3, 0), "keyctl(GET_KEYRING_ID)"),
         ("add_key", (0, 0, 0, 0, 0), "add_key"),
         ("open_by_handle_at", (-1, 0, 0), "open_by_handle_at"),
@@ -283,6 +283,9 @@ def probe_syscalls():
         ("vmsplice", (-1, 0, 0, 0), "vmsplice"),
         ("io_setup", (1, 0), "io_setup (legacy AIO)"),
         ("remap_file_pages", (0, 0, 0, 0, 0), "remap_file_pages"),
+        # loading a classic BPF program into the kernel; flags 0 with no program: EFAULT if reached
+        ("seccomp", (1, 0, 0), "seccomp(SECCOMP_SET_MODE_FILTER)"),
+        ("sendfile", (-1, -1, 0, 1), "sendfile (zero-copy into pipes, like splice)"),
     ]
     for name, args, what in cases:
         number = nr(name)
@@ -293,6 +296,16 @@ def probe_syscalls():
 
 
 def probe_clone_newuser():
+    # The clone(2) flag filter itself: no other probe issues clone with a namespace flag.
+    def clone_newuser():
+        ret, err = raw_syscall(nr("clone"), 0x10000000 | signal.SIGCHLD, 0, 0, 0, 0)  # CLONE_NEWUSER
+        if ret == 0:
+            os._exit(0)  # the child, in a new user namespace: proof enough, leave at once
+        if ret > 0:
+            os.waitpid(ret, 0)
+        return [ret, err]
+    judge_syscall("sys.clone_newuser", in_child(clone_newuser), "clone(CLONE_NEWUSER)")
+
     # Python's os.fork uses clone without namespace flags; exercise the flag filter directly via libc.
     if not hasattr(os, "unshare"):
         def via_libc():

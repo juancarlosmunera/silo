@@ -135,6 +135,8 @@ DENY: dict[str, str] = {
     "splice": "page-cache/pipe splicing (Dirty Pipe class)",
     "tee": "pipe buffer duplication (Dirty Pipe class)",
     "remap_file_pages": "deprecated nonlinear mappings",
+    "sendfile": "into a pipe it shares page-cache pages as splice does (Dirty Pipe class)",
+    "seccomp": "loads classic BPF programs into the kernel; prctl(PR_SET_SECCOMP) is refused already",
     "io_setup": "legacy AIO: unneeded, recurring use-after-free source",
     "io_destroy": "legacy AIO",
     "io_submit": "legacy AIO",

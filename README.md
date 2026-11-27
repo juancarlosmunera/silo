@@ -77,7 +77,7 @@ The reasoning behind each control, and what is left over, is in
 ## Check it yourself
 
 None of the above is taken on trust. `silo probe` starts a sandbox with exactly the flags the model
-gets and runs 73 probes inside it: reach the network through a dozen socket types, create
+gets and runs 76 probes inside it: reach the network through a dozen socket types, create
 namespaces, call the kernel interfaces listed above, use syscall arguments outside the allowlists,
 start a second program, find a location that is both writable and
 executable, find host sockets and credentials, and check the process's own privileges and limits.
@@ -85,8 +85,8 @@ executable, find host sockets and credentials, and check the process's own privi
 
 | | stock rootless Podman | silo |
 |---|---|---|
-| contained (PASS) | 27 | 73 |
-| not contained (FAIL) | 38 | 0 |
+| contained (PASS) | 27 | 76 |
+| not contained (FAIL) | 41 | 0 |
 | weaker than intended (WARN) | 7 | 0 |
 
 These are the numbers from the development machine. One probe is skipped in the baseline because
@@ -173,7 +173,7 @@ silo probe      # run the escape probes in a sandbox identical to the model's
  PASS sys.unshare                    unshare(CLONE_NEWUSER): refused (EPERM)
  PASS fs.writable_noexec             writable locations ['/tmp'] are all noexec
  ...
-PASS=73  FAIL=0  WARN=0  SKIP=0
+PASS=76  FAIL=0  WARN=0  SKIP=0
 ```
 
 **4. Start it.**
