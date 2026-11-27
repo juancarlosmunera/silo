@@ -21,7 +21,8 @@ from collections.abc import Collection
 
 TOOL_KEYS = ("tools", "tool_choice", "functions", "function_call", "parallel_tool_calls")
 # The OpenAI API's constraint on function names; also what config.gateway.tools must match.
-NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Always used with fullmatch: `$` would also match before a trailing newline.
+NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 CHOICE_MODES = frozenset({"none", "auto", "required"})
 
 
@@ -74,13 +75,21 @@ def _check_choice(choice, offered: list[str], key: str) -> None:
 def offered_tools(request: dict, allow: bool, allowlist: Collection[str]) -> list[str]:
     """Check a request's tool keys against the policy; return the tool names it offers."""
     present = [k for k in TOOL_KEYS if k in request]
+    # llama-server hands chat_template_kwargs to the chat template, where `tools` is what a template
+    # renders tool definitions from: the same keys there are the same request.
+    kwargs = request.get("chat_template_kwargs")
+    if isinstance(kwargs, dict):
+        hidden = [k for k in TOOL_KEYS if k in kwargs]
+        if hidden:
+            raise ToolPolicyError(403 if not allow else 400,
+                                  f"tool keys inside chat_template_kwargs are not accepted: {', '.join(hidden)}")
     if not present:
         return []
     if not allow:
         raise ToolPolicyError(403, f"tool calling is disabled (gateway.allow_tools = false): {', '.join(present)}")
     names = _function_names(request)
     for name in names:
-        if not isinstance(name, str) or not NAME_RE.match(name):
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name):
             raise _bad("tool names must match [A-Za-z0-9_-]{1,64}")
     if len(set(names)) != len(names):
         raise _bad("tool names must be unique")
@@ -97,32 +106,69 @@ def offered_tools(request: dict, allow: bool, allowlist: Collection[str]) -> lis
     return names
 
 
+def callable_tools(request: dict, offered: list[str]) -> tuple[list[str], int | None]:
+    """What the model may call in its answer: (tool names, maximum number of calls or None).
+
+    The request's own constraints are enforced on the response too, not only passed to the runtime:
+    `tool_choice: "none"` means no call at all, naming a tool means that tool only, and
+    `parallel_tool_calls: false` means one call.
+    """
+    names, limit = list(offered), None
+    for key in ("tool_choice", "function_call"):
+        choice = request.get(key)
+        if choice == "none":
+            names = []
+        elif isinstance(choice, dict):
+            forced = choice["function"]["name"] if key == "tool_choice" else choice["name"]
+            names = [n for n in names if n == forced]
+    if request.get("parallel_tool_calls") is False:
+        limit = 1
+    return names, limit
+
+
+def _index(value, default: int) -> int:
+    if value is None:
+        return default
+    if type(value) is not int or value < 0:  # not a bool, a float or a string that a client reads as 0
+        raise CallChecker._refuse("tool call index must be a non-negative integer")
+    return value
+
+
 class CallChecker:
     """Checks the tool calls in one response, or across every chunk of one stream.
 
     Streamed calls arrive in pieces: the first delta for a call carries its name, later ones carry
-    argument fragments for the same (choice, call) index. Names are therefore tracked per slot and
-    argument sizes summed per slot.
+    argument fragments for the same (choice, call) index. Names are therefore tracked per slot.
+
+    Anything not shaped as the API says is refused rather than skipped: a client in another language
+    may read it all the same (a JavaScript client reads `choices[0]` from an object as well as from a
+    list). Argument sizes are summed per call index across choices, which is how clients that ignore
+    the choice index put the pieces together.
     """
 
-    def __init__(self, offered: Collection[str], max_argument_bytes: int):
+    def __init__(self, offered: Collection[str], max_argument_bytes: int, max_calls: int | None = None):
         self.offered = frozenset(offered)
         self.max_argument_bytes = max_argument_bytes
+        self.max_calls = max_calls
         self._names: dict[tuple, str] = {}
         self._sizes: dict[tuple, int] = {}
 
     def check(self, payload: dict) -> None:
-        choices = payload.get("choices") or []
-        if not isinstance(choices, list):
+        choices = payload.get("choices")
+        if choices is None:
             return
+        if not isinstance(choices, list):
+            raise self._refuse("malformed choices")
         for pos, choice in enumerate(choices):
             if not isinstance(choice, dict):
-                continue
-            index = choice.get("index", pos)
+                raise self._refuse("malformed choice")
+            index = _index(choice.get("index"), pos)
             for key in ("message", "delta"):
                 msg = choice.get(key)
-                if not isinstance(msg, dict):
+                if msg is None:
                     continue
+                if not isinstance(msg, dict):
+                    raise self._refuse(f"malformed {key}")
                 calls = msg.get("tool_calls")
                 if calls:
                     if not isinstance(calls, list):
@@ -130,10 +176,10 @@ class CallChecker:
                     for call_pos, call in enumerate(calls):
                         if not isinstance(call, dict):
                             raise self._refuse("malformed tool call")
-                        self._call((repr(index), "tool", repr(call.get("index", call_pos))), call.get("function"))
+                        self._call((index, "tool", _index(call.get("index"), call_pos)), call.get("function"))
                 legacy = msg.get("function_call")
                 if legacy:
-                    self._call((repr(index), "function"), legacy)
+                    self._call((index, "function", 0), legacy)
 
     @staticmethod
     def _refuse(message: str) -> ToolPolicyError:
@@ -153,6 +199,8 @@ class CallChecker:
                 raise self._refuse("tool name changed mid-stream")
             if name not in self.offered:
                 raise self._refuse(f"{name[:64]!r} was not offered by the request")
+            if known is None and self.max_calls is not None and len(self._names) >= self.max_calls:
+                raise self._refuse(f"more than {self.max_calls} tool call(s) (parallel_tool_calls = false)")
             self._names[slot] = name
         if arguments in (None, ""):
             return
@@ -160,7 +208,8 @@ class CallChecker:
             raise self._refuse("arguments must be a string")
         if slot not in self._names:
             raise self._refuse("arguments sent before the tool was named")
-        size = self._sizes.get(slot, 0) + len(arguments.encode("utf-8", "surrogatepass"))
+        merged = slot[1:]  # the same call index in every choice
+        size = self._sizes.get(merged, 0) + len(arguments.encode("utf-8", "surrogatepass"))
         if size > self.max_argument_bytes:
             raise self._refuse(f"arguments exceed {self.max_argument_bytes} bytes (gateway.max_tool_arguments_bytes)")
-        self._sizes[slot] = size
+        self._sizes[merged] = size
