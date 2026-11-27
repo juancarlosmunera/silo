@@ -49,6 +49,14 @@ class ServerCommandTests(unittest.TestCase):
             with self.subTest(flag=flag):
                 runtime.check_extra_args([flag, "1"])
 
+    def test_underscore_spellings_are_the_same_flags(self):
+        # llama.cpp reads underscores in long options as dashes
+        for flag in ("--mcp_servers_json", "--MCP-servers-json", "--model_url=x", "--hf_repo", "--slot_save_path",
+                     "--webui_mcp_proxy", "--connect", "--connect_code", "--api_key"):
+            with self.subTest(flag=flag), self.assertRaises(ConfigError):
+                runtime.check_extra_args([flag, "1"])
+        runtime.check_extra_args(["--n_gpu_layers", "0"])
+
     def test_dangerous_server_flags_rejected(self):
         for flag in ("--tools=all", "--agent", "-ag", "--rpc", "-hf", "--hf-repo", "--model-url", "-mu", "--host",
                      "--port", "--reuse-port", "--webui-mcp-proxy", "--ui-mcp-proxy", "--mcp-servers-config",
