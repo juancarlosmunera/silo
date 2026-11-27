@@ -12,7 +12,7 @@ a short JSON description that names the container's first process. The superviso
     That is the runtime executing the image's entrypoint, before any code from the image has run;
   * refuses every later one with EPERM, or, with seccomp_action = "kill", kills the process that
     made the call, as a seccomp kill would;
-  * records each refusal in silo's audit log.
+  * records each refusal in silo's audit log (a sample of them once there are more than a hundred).
 
 The decision never looks at the arguments of the call, only at which call it is, so the usual
 objection to continuing a notified syscall (the target can change its arguments after they were
@@ -88,13 +88,22 @@ class Decider:
 
 
 def _tgid(tid: int) -> int | None:
+    """The thread group of `tid`, from /proc.
+
+    The first line of that file is the thread's name, which the sandboxed process chooses: it can
+    hold a carriage return, invalid UTF-8 or text that looks like another field. So the file is read
+    as bytes and split on newlines only, which the kernel escapes in the name, and the field is
+    looked for at the start of a line after the name.
+    """
     try:
-        with open(f"/proc/{tid}/status") as fh:
-            for line in fh:
-                if line.startswith("Tgid:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError):
-        pass
+        with open(f"/proc/{tid}/status", "rb") as fh:
+            lines = fh.read(1 << 16).split(b"\n")
+    except OSError:
+        return None
+    for line in lines[1:]:
+        if line.startswith(b"Tgid:\t"):
+            value = line[6:].strip()
+            return int(value) if value.isdigit() else None
     return None
 
 
@@ -187,13 +196,23 @@ def _drop_privileges(uid: int, keep_kill: bool) -> None:
         raise RuntimeError(f"unexpected capabilities after dropping privileges: {_capabilities()}")
 
 
+REPORT_FIRST = 100       # refusals recorded one by one; after that one line per REPORT_EVERY
+REPORT_EVERY = 10_000    # so that a sandbox looping on execve cannot fill the disk through the logs
+
+
 def _reporter(audit_fd: int | None, name: str):
     def report(pid: int, syscall: int, count: int, outcome: str) -> None:
+        # count includes the one allowed execve, so refusals are count - 1
+        refused = count - 1
+        if refused > REPORT_FIRST and refused % REPORT_EVERY:
+            return
+        if refused > REPORT_FIRST:
+            outcome = f"{outcome}; {refused} refused so far, only every {REPORT_EVERY}th is recorded"
         print(f"execlock: execve #{count} by pid {pid} (syscall {syscall}): {outcome}", file=sys.stderr, flush=True)
         if audit_fd is None:
             return
         entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "silo": name, "event": "exec_refused",
-                 "pid": pid, "syscall": syscall, "outcome": outcome}
+                 "pid": pid, "syscall": syscall, "refused": refused, "outcome": outcome}
         try:
             os.write(audit_fd, (json.dumps(entry, separators=(",", ":")) + "\n").encode())
         except OSError:

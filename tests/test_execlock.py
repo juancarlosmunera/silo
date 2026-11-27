@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from unittest import mock
 
 from silo import execlock
 
@@ -113,10 +114,10 @@ class DeciderTests(unittest.TestCase):
 class KernelTests(unittest.TestCase):
     """The supervisor loop against a real seccomp notification descriptor."""
 
-    def run_child(self, kill: bool, init_pid_offset: int = 0):
+    def run_child(self, kill: bool, init_pid_offset: int = 0, second: str = SECOND):
         ours, theirs = socket.socketpair()
         child = subprocess.Popen(
-            [sys.executable, "-I", "-c", CHILD, str(theirs.fileno()), *map(str, SYSCALLS[platform.machine()]), SECOND],
+            [sys.executable, "-I", "-c", CHILD, str(theirs.fileno()), *map(str, SYSCALLS[platform.machine()]), second],
             pass_fds=[theirs.fileno()], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         theirs.close()
         listener = None
@@ -158,6 +159,33 @@ class KernelTests(unittest.TestCase):
         code, out, err, refusals, _decider = self.run_child(kill=True)
         self.assertEqual((code, out), (-signal.SIGKILL, ""), err)
         self.assertEqual([event[3] for event in refusals], ["killed"])
+
+    def test_the_caller_chooses_its_thread_name_but_not_who_is_killed(self):
+        # The thread name is the first line of /proc/<tid>/status and the sandbox sets it freely:
+        # a carriage return and a fake field must not make the supervisor kill someone else, and
+        # bytes that are not UTF-8 must not make it give up on killing the caller.
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(victim.wait)
+        self.addCleanup(victim.kill)
+        for name in (f"\\rTgid:\\t{victim.pid}", "\\xff\\xfe"):
+            with self.subTest(name=name):
+                second = ("import ctypes\n"
+                          f"ctypes.CDLL(None).prctl(15, b'{name}', 0, 0, 0)\n") + SECOND
+                code, out, err, refusals, _decider = self.run_child(kill=True, second=second)
+                self.assertEqual((code, out), (-signal.SIGKILL, ""), err)
+                self.assertEqual([event[3] for event in refusals], ["killed"])
+                self.assertIsNone(victim.poll(), "the supervisor killed a process that never called execve")
+
+    def test_refusals_are_recorded_one_by_one_then_sampled(self):
+        lines = []
+        with mock.patch("sys.stderr") as stderr:
+            stderr.write.side_effect = lambda text: lines.append(text) if text.strip() else None
+            report = execlock._reporter(None, "x")
+            for count in range(2, 2 + 25_000):
+                report(12, 59, count, "refused (EPERM)")
+        recorded = [line for line in lines if line.startswith("execlock: execve #")]
+        self.assertEqual(len(recorded), execlock.REPORT_FIRST + 2)  # the first hundred, then #10000 and #20000
+        self.assertIn("20000 refused so far", recorded[-1])
 
     def test_exec_by_anything_but_the_first_process_is_refused_from_the_start(self):
         code, out, err, refusals, _decider = self.run_child(kill=False, init_pid_offset=1)
