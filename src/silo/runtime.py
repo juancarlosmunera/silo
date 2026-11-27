@@ -299,7 +299,15 @@ def _helper_pid(pidfile: Path) -> int | None:
         pid = int(pidfile.read_text().strip())
     except (OSError, ValueError):
         return None
-    return pid if pid > 1 and Path(f"/proc/{pid}").exists() else None
+    if pid <= 1:
+        return None
+    # A pidfile outlives its process (a crash, a reboot) and PIDs are reused, by the sandbox too, which
+    # can burn through them quickly. Only a process started with this very pidfile is ours.
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    return pid if os.fsencode(str(pidfile)) in argv else None
 
 
 def _stop_helper(pidfile: Path) -> None:
@@ -307,9 +315,9 @@ def _stop_helper(pidfile: Path) -> None:
     if pid is None:
         return
     deadline = time.monotonic() + 3  # helpers exit by themselves once the sandbox's processes are gone
-    while time.monotonic() < deadline and Path(f"/proc/{pid}").exists():
+    while time.monotonic() < deadline and _helper_pid(pidfile) == pid:
         time.sleep(0.1)
-    if Path(f"/proc/{pid}").exists():  # they may run as a subordinate UID: signal from inside the namespace
+    if _helper_pid(pidfile) == pid:  # they may run as a subordinate UID: signal from inside the namespace
         run(["podman", "unshare", "kill", "-KILL", str(pid)], check=False)
 
 
@@ -353,7 +361,10 @@ def start_exec_supervisor(cfg: Config, directory: Path) -> None:
 
 def execs_refused(directory: Path) -> int:
     """How many execve calls this sandbox's supervisor has refused so far."""
-    return sum(1 for line in _read_log(directory / EXEC_LOG).splitlines() if line.startswith("execlock: execve #"))
+    # Lines carry the running number of the execve (the allowed first one included); after the first
+    # hundred refusals the supervisor records only a sample, so the last number is the count.
+    numbers = re.findall(r"^execlock: execve #(\d+) ", _read_log(directory / EXEC_LOG), re.M)
+    return int(numbers[-1]) - 1 if numbers else 0
 
 
 # --------------------------------------------------------------------------------------- lifecycle

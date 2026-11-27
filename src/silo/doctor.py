@@ -248,7 +248,7 @@ def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
                   "memfd_create stays allowed", "GPU drivers are large kernel attack surface; prefer CPU for "
                   "untrusted models"))
     if cfg.runtime.seccomp_action == "kill":
-        add(Check("seccomp action", OK, "kill: the first denied syscall terminates the runtime"))
+        add(Check("seccomp action", OK, "kill: the first call to a syscall silo denies terminates the runtime (syscalls the kernel or the base profile refuse still fail with an error)"))
     else:
         add(Check("seccomp action", WARN, "errno: denied syscalls fail quietly, so a compromised runtime can "
                   "keep probing", 'runtime.seccomp_action = "kill" once your model runs cleanly'))

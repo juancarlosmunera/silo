@@ -24,13 +24,14 @@ from pathlib import Path
 DEFAULT_IMAGE = "ghcr.io/ggml-org/llama.cpp:server"
 DEFAULT_PROBE_IMAGE = "docker.io/library/python:3.13-slim"
 DEFAULT_SECCOMP_BASE = Path("/usr/share/containers/seccomp.json")
+# Every pattern below is applied with fullmatch: `$` alone also matches before a trailing newline.
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 _MEMORY_RE = re.compile(r"^\d+[bkmg]?$", re.IGNORECASE)
 # An image reference can never look like a podman option or carry whitespace.
 _IMAGE_RE = re.compile(r"^[a-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_TOOL_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # silo.toolpolicy.NAME_RE; config must not import the gateway side
+_TOOL_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")  # silo.toolpolicy.NAME_RE; config must not import the gateway side
 # Never a model directory themselves (a dedicated directory below /srv, /opt, /mnt ... is fine).
 _SYSTEM_DIRS = frozenset(Path(p) for p in (
     "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/media", "/mnt", "/opt", "/proc", "/root",
@@ -205,7 +206,7 @@ def _check_model_dir(path: Path) -> None:
 
 def memory_bytes(value: str) -> int:
     """A runtime.memory value (8g, 512m, 100k, 4096, 4096b) in bytes."""
-    if not _MEMORY_RE.match(value):
+    if not _MEMORY_RE.fullmatch(value):
         raise ConfigError("runtime.memory must look like 8g, 512m, ...")
     digits = value.rstrip("bkmgBKMG")
     return int(digits) * {"": 1, "b": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[value[len(digits):].lower()]
@@ -254,17 +255,17 @@ def _check_origin(origin: str) -> None:
 
 
 def validate(cfg: Config) -> Config:
-    if not isinstance(cfg.name, str) or not _NAME_RE.match(cfg.name):
+    if not isinstance(cfg.name, str) or not _NAME_RE.fullmatch(cfg.name):
         raise ConfigError(f"invalid silo name {cfg.name!r}: use [a-z0-9_.-], max 63 chars")
     rt, gw, m = cfg.runtime, cfg.gateway, cfg.model
     for label, image in (("runtime.image", rt.image), ("runtime.probe_image", rt.probe_image)):
-        if not _IMAGE_RE.match(image):
+        if not _IMAGE_RE.fullmatch(image):
             raise ConfigError(f"{label} is not a valid image reference: {image!r}")
     if rt.gpu not in ("none", "nvidia", "amd", "dri"):
         raise ConfigError("runtime.gpu must be one of: none, nvidia, amd, dri")
     if rt.seccomp_action not in ("errno", "kill"):
         raise ConfigError("runtime.seccomp_action must be 'errno' or 'kill'")
-    if not _MEMORY_RE.match(rt.memory):
+    if not _MEMORY_RE.fullmatch(rt.memory):
         raise ConfigError("runtime.memory must look like 8g, 512m, ...")
     if rt.pids_limit < 16:
         raise ConfigError("runtime.pids_limit must be >= 16")
@@ -291,14 +292,14 @@ def validate(cfg: Config) -> Config:
         raise ConfigError("gateway size and concurrency limits must be >= 1")
     if gw.tools and not gw.allow_tools:
         raise ConfigError("gateway.tools is set but gateway.allow_tools = false; enable tool calling or remove the list")
-    bad_tools = [t for t in gw.tools if not _TOOL_RE.match(t)]
+    bad_tools = [t for t in gw.tools if not _TOOL_RE.fullmatch(t)]
     if bad_tools or len(set(gw.tools)) != len(gw.tools):
         raise ConfigError("gateway.tools must be unique names matching [A-Za-z0-9_-]{1,64}")
     if gw.max_tool_arguments_bytes < 1:
         raise ConfigError("gateway.max_tool_arguments_bytes must be >= 1")
     for origin in gw.allowed_origins:
         _check_origin(origin)
-    if gw.api_key_env is not None and not _ENV_RE.match(gw.api_key_env):
+    if gw.api_key_env is not None and not _ENV_RE.fullmatch(gw.api_key_env):
         raise ConfigError("gateway.api_key_env must be an environment variable name")
     if m.ctx_size < 1 or (m.threads is not None and m.threads < 1):
         raise ConfigError("model.ctx_size and model.threads must be >= 1")

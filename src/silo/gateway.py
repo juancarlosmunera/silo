@@ -307,7 +307,8 @@ def _make_handler(gw: Gateway):
                 if not gw.slots.acquire(timeout=5):
                     raise Reject(429, "too many concurrent requests")
                 held = True
-                calls = toolpolicy.CallChecker(offered, cfg.max_tool_arguments_bytes)
+                callable_, max_calls = offered
+                calls = toolpolicy.CallChecker(callable_, cfg.max_tool_arguments_bytes, max_calls)
                 self._proxy(method, path, body, stream, calls, entry)
             except (Reject, toolpolicy.ToolPolicyError) as reject:
                 self._fail(reject.status, reject.message, entry)
@@ -328,7 +329,7 @@ def _make_handler(gw: Gateway):
                 if held:
                     gw.slots.release()
 
-        def _admit(self, method: str, path: str, entry: dict) -> tuple[bytes, bool, list[str]] | None:
+        def _admit(self, method: str, path: str, entry: dict) -> tuple[bytes, bool, tuple] | None:
             """Every check a request must pass before anything is sent to the model."""
             if gw.loopback_only and _hostname(self.headers.get("Host", "")) not in LOOPBACK_HOSTS:
                 raise Reject(403, "Host header is not a loopback name (DNS-rebinding protection)")
@@ -349,7 +350,7 @@ def _make_handler(gw: Gateway):
                 if not hmac.compare_digest(supplied.encode(), f"Bearer {gw.api_key}".encode()):
                     raise Reject(401, "missing or invalid API key")
             if method != "POST":
-                return b"", False, []
+                return b"", False, ([], None)
 
             if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != JSON_TYPE:
                 raise Reject(415, "Content-Type must be application/json")
@@ -382,7 +383,7 @@ def _make_handler(gw: Gateway):
             offered = toolpolicy.offered_tools(request, cfg.allow_tools, cfg.tools)
             if offered:
                 entry["tools_offered"] = offered
-            return body, stream, offered
+            return body, stream, toolpolicy.callable_tools(request, offered)
 
         def _preflight(self, path: str, entry: dict) -> None:
             """Answer a CORS preflight from an allowed origin. Nothing reaches the model.

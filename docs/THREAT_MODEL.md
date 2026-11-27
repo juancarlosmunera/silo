@@ -142,7 +142,8 @@ container's first process, and the supervisor:
   runtime executing the image's entrypoint, before any code from the image has run;
 - refuses every later one with `EPERM`, or with `seccomp_action = "kill"` kills the process that
   made it, as a seccomp kill would;
-- writes each refusal to the audit log (`"event": "exec_refused"`).
+- writes each refusal to the audit log (`"event": "exec_refused"`): the first hundred one by one, then one
+  line per ten thousand with the running count, so that a sandbox looping on execve cannot fill the disk.
 
 The decision depends only on which call it is, never on its arguments, so the known weakness of
 continuing a notified system call (the caller can change the arguments after they were looked at)

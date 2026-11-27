@@ -1,5 +1,7 @@
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -16,6 +18,19 @@ def cfg_with(extra=()):
     cfg.model.file = "kimi/Kimi-K2-Q2_K-00001-of-00008.gguf"
     cfg.model.extra_args = list(extra)
     return cfg
+
+
+def stand_in_helper(test, pidfile):
+    """A process started with `pidfile` in its arguments, as silo's helpers are."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "--pidfile", str(pidfile)])
+    test.addCleanup(proc.wait)
+    test.addCleanup(proc.kill)
+    deadline = time.monotonic() + 10
+    while os.fsencode(str(pidfile)) not in Path(f"/proc/{proc.pid}/cmdline").read_bytes().split(b"\0"):
+        if time.monotonic() > deadline:
+            test.fail("the stand-in helper did not start")
+        time.sleep(0.01)
+    return proc
 
 
 class ServerCommandTests(unittest.TestCase):
@@ -235,8 +250,16 @@ class RunDirTests(unittest.TestCase):
         runtime.prepare_run_dir(self.cfg)
         self.assertIsNone(runtime.connector_pid(self.cfg))
         self.assertFalse(runtime.runtime_reachable(self.cfg))
+        # a live process that was not started with this pidfile is not the connector (a stale
+        # pidfile whose PID was reused), and must never be signalled as one
         self.cfg.connector_pidfile.write_text(f"{os.getpid()}\n")
-        self.assertEqual(runtime.connector_pid(self.cfg), os.getpid())
+        self.assertIsNone(runtime.connector_pid(self.cfg))
+        with mock.patch.object(runtime, "run") as run:
+            runtime.stop_connector(self.cfg)
+        run.assert_not_called()
+        helper = stand_in_helper(self, self.cfg.connector_pidfile)
+        self.cfg.connector_pidfile.write_text(f"{helper.pid}\n")
+        self.assertEqual(runtime.connector_pid(self.cfg), helper.pid)
         self.assertFalse(runtime.runtime_reachable(self.cfg))  # no control socket yet
         for junk in ("", "abc", "1", "-5"):
             self.cfg.connector_pidfile.write_text(junk)
@@ -323,7 +346,11 @@ class ExecLockTests(unittest.TestCase):
         cfg = cfg_with()
         self.assertEqual(runtime.exec_lock_state(cfg), "on (supervisor not running)")
         cfg.socket_dir.mkdir(parents=True)
-        (cfg.socket_dir / runtime.EXEC_PIDFILE).write_text(f"{os.getpid()}\n")
+        pidfile = cfg.socket_dir / runtime.EXEC_PIDFILE
+        pidfile.write_text(f"{os.getpid()}\n")  # some live process, not the supervisor
+        self.assertEqual(runtime.exec_lock_state(cfg), "on (supervisor not running)")
+        helper = stand_in_helper(self, pidfile)
+        pidfile.write_text(f"{helper.pid}\n")
         self.assertEqual(runtime.exec_lock_state(cfg), "on")
         cfg.runtime.exec_lock = False
         self.assertIn("off", runtime.exec_lock_state(cfg))

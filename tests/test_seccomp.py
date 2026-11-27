@@ -15,7 +15,8 @@ FIXTURE = {
     "syscalls": [
         {"names": ["read", "write", "clone", "clone3", "unshare", "socket", "socketpair", "socketcall", "ptrace",
                    "mount", "keyctl", "memfd_create", "io_uring_setup", "msgget", "msgsnd", "splice", "vmsplice",
-                   "io_setup", "mq_open", "futex", "mmap", "execve", "execveat"], "action": "SCMP_ACT_ALLOW",
+                   "io_setup", "mq_open", "futex", "mmap", "execve", "execveat", "ioctl", "prctl", "setsockopt",
+                   "io_uring_enter", "io_uring_register", "seccomp", "sendfile"], "action": "SCMP_ACT_ALLOW",
          "args": [], "includes": {}, "excludes": {}},
         {"names": ["bpf"], "action": "SCMP_ACT_ALLOW", "args": [], "includes": {"caps": ["CAP_SYS_ADMIN"]}},
         {"names": ["socket"], "action": "SCMP_ACT_ALLOW", "args": [{"index": 0, "value": 16, "op": "SCMP_CMP_NE"}],
@@ -284,6 +285,52 @@ class ArgumentAllowlistTests(unittest.TestCase):
                              if all(OPS[c["op"]](({0: 0, 1: 0, 2: 0} | args)[c["index"]], c) for c in r["args"]))
                 self.assertEqual(first["action"], verdict)
 
+
+
+
+def verdict(profile, name, args=None):
+    """The action the kernel takes, with libseccomp's precedence: an unconditional rule for a
+    syscall wins over any argument-filtered one; otherwise the matching argument rule; otherwise the
+    default action."""
+    args = {i: 0 for i in range(6)} | (args or {})
+    rules = rules_for(profile, name)
+    plain = [r for r in rules if not r.get("args")]
+    if plain:
+        return plain[0]["action"]
+    hits = matching(rules, args)
+    return hits[0]["action"] if hits else profile["defaultAction"]
+
+
+class VerdictTests(unittest.TestCase):
+    """What the profile does to calls an attacker would make, as the kernel would decide them.
+
+    Unlike tests of the profile's structure, these fail when a base-profile rule survives next to
+    silo's own, when the default action is wrong, or when a value is left out of a rule."""
+
+    def test_denied(self):
+        for action, refused in (("errno", "SCMP_ACT_ERRNO"), ("kill", "SCMP_ACT_KILL_PROCESS")):
+            p = seccomp.harden(FIXTURE, machine="x86_64", action=action)
+            self.assertNotIn("architectures", p)
+            self.assertEqual(p["defaultAction"], "SCMP_ACT_ERRNO")
+            self.assertEqual(verdict(p, "no_such_syscall"), "SCMP_ACT_ERRNO")
+            for name, args in (("ioctl", {1: 0x5412}),                       # TIOCSTI
+                               ("prctl", {0: 22}),                           # PR_SET_SECCOMP
+                               ("setsockopt", {1: 1, 2: 51}),                # SO_ATTACH_REUSEPORT_CBPF
+                               ("setsockopt", {1: 1, 2: 1 << 16 | 2}),       # an option above 0xFFFF
+                               ("clone", {0: 0x10000000 | 17}),              # CLONE_NEWUSER
+                               ("clone", {0: 0x40000000 | 17}),              # CLONE_NEWNET
+                               ("socket", {0: 2}),                           # AF_INET
+                               ("io_uring_setup", {}), ("io_uring_enter", {}), ("io_uring_register", {}),
+                               ("seccomp", {}), ("sendfile", {}), ("unshare", {}), ("ptrace", {})):
+                with self.subTest(action=action, name=name, args=args):
+                    self.assertEqual(verdict(p, name, args), refused)
+
+    def test_allowed(self):
+        p = seccomp.harden(FIXTURE, machine="x86_64")
+        for name, args in (("read", {}), ("ioctl", {1: 0x5401}), ("prctl", {0: 15}),
+                           ("setsockopt", {1: 1, 2: 2}), ("clone", {0: 0x3D0F00}), ("socket", {0: 1})):
+            with self.subTest(name=name, args=args):
+                self.assertEqual(verdict(p, name, args), "SCMP_ACT_ALLOW")
 
 if __name__ == "__main__":
     unittest.main()
