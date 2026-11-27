@@ -59,14 +59,36 @@ def rewrite(path, edit):
     os.replace(tmp, path)
 
 
+# Global options of crun and runc that take a separate value: that value is not the subcommand.
+VALUED = {{"--root", "--log", "--log-format", "--log-level", "--cgroup-manager", "--criu", "--rootless"}}
+STARTS_A_CONTAINER = {{"create", "run", "restore"}}
+COMMANDS = STARTS_A_CONTAINER | {{"exec", "start", "state", "kill", "delete", "pause", "resume", "update",
+                                  "features", "checkpoint", "list", "ps", "spec", "events"}}
+
+
+def subcommand(args):
+    """(index, name) of the subcommand: the first argument that is neither an option nor its value."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg.startswith("-"):
+            return i, arg
+        i += 2 if arg in VALUED else 1
+    return None, None
+
+
 args = sys.argv[1:]
-if "create" in args or "run" in args:      # the container's first process
-    bundle = option(args, "--bundle", "-b")
+at, command = subcommand(args)
+if command is not None and command not in COMMANDS:
+    sys.exit(f"silo: unknown runtime command {{command!r}}; refusing to run it unconfined")
+rest = args[at + 1:] if at is not None else []
+if command in STARTS_A_CONTAINER:          # the container's first process
+    bundle = option(rest, "--bundle", "-b")
     if bundle is None:
         sys.exit("silo: no --bundle in the runtime's arguments; refusing to start an unconfined container")
     rewrite(os.path.join(bundle, "config.json"), lambda spec: spec["process"].__setitem__("apparmorProfile", PROFILE))
-elif "exec" in args:                       # a process added later (podman exec)
-    process = option(args, "--process", "-p")
+elif command == "exec":                    # a process added later (podman exec)
+    process = option(rest, "--process", "-p")
     if process is None:
         sys.exit("silo: no --process in the runtime's arguments; refusing to start an unconfined process")
     rewrite(process, lambda spec: spec.__setitem__("apparmorProfile", PROFILE))

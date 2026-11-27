@@ -79,6 +79,32 @@ class WrapperTests(unittest.TestCase):
                 self.assertEqual((res.returncode, called), (0, args))
         self.assertEqual((self.bundle / "config.json").read_text(), before)
 
+    def test_restore_starts_a_container_too(self):
+        res, called = self.run_wrapper("restore", "--bundle", str(self.bundle), "--image-path", "/x", "abc123")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.config()["process"]["apparmorProfile"], "silo-runtime")
+        res, called = self.run_wrapper("restore", "--image-path", "/x", "abc123")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIsNone(called)
+
+    def test_the_subcommand_is_not_confused_with_option_values(self):
+        process = self.dir / "process.json"
+        process.write_text(json.dumps({"args": ["/bin/sh"]}))
+        # an exec whose pid file is called "create": the process, not the bundle, gets the profile
+        res, called = self.run_wrapper("exec", "--pid-file", "create", "--process", str(process), "abc123")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(process.read_text())["apparmorProfile"], "silo-runtime")
+        # global option values that look like subcommands
+        for args in (["--root", "run", "kill", "abc123", "TERM"], ["--log", "create", "state", "abc123"],
+                     ["--root", "exec", "delete", "abc123"], ["kill", "exec"]):
+            with self.subTest(args=args):
+                res, called = self.run_wrapper(*args)
+                self.assertEqual((res.returncode, called), (0, args), res.stderr)
+        # a command the wrapper does not know could start something: refused
+        res, called = self.run_wrapper("--debug", "frobnicate", "abc123")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIsNone(called)
+
     def test_fails_closed_when_it_cannot_set_the_profile(self):
         res, called = self.run_wrapper("create", "abc123")            # no bundle named
         self.assertNotEqual(res.returncode, 0)
