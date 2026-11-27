@@ -78,5 +78,49 @@ class MountOptionTests(unittest.TestCase):
         self.assertEqual(probes.mount_options("/tmp", ["garbage"]), set())
 
 
+class LsmVerdictTests(unittest.TestCase):
+    """What the probes make of the label in /proc/self/attr/current."""
+
+    def verdict(self, label, canary=None):
+        return probes.lsm_verdict(label, lambda: canary)[0]
+
+    def denied(self):
+        return PermissionError(13, "Permission denied")
+
+    def test_selinux(self):
+        self.assertEqual(self.verdict("system_u:system_r:container_t:s0:c12,c34"), "PASS")
+        self.assertEqual(self.verdict("unconfined_u:unconfined_r:container_runtime_t:s0"), "WARN")
+        self.assertEqual(self.verdict("unconfined_u:unconfined_r:unconfined_t:s0"), "WARN")
+
+    def test_no_confinement(self):
+        for label in ("", "unconfined", "crun (unconfined)", "something-odd"):
+            with self.subTest(label=label):
+                self.assertEqual(self.verdict(label), "WARN")
+
+    def test_silos_apparmor_profile_must_be_enforced_not_just_attached(self):
+        for label in ("silo-runtime (enforce)", "crun//&silo-runtime (mixed)", "silo-runtime//&crun (mixed)"):
+            with self.subTest(label=label):
+                self.assertEqual(self.verdict(label, self.denied()), "PASS")   # the profile refused the canary
+                self.assertEqual(self.verdict(label, None), "WARN")            # complain mode: it went through
+                self.assertEqual(self.verdict(label, OSError(30, "Read-only file system")), "WARN")
+
+    def test_a_stack_without_silos_profile_is_not_confinement(self):
+        refused = self.denied()
+        self.assertEqual(self.verdict("crun//&docker-default (mixed)", refused), "WARN")
+        self.assertEqual(self.verdict("not-silo-runtime (complain)", refused), "WARN")
+        self.assertEqual(self.verdict("docker-default (enforce)"), "PASS")  # some other enforcing profile
+
+    def test_the_profile_file_agrees_with_the_probe(self):
+        from pathlib import Path
+        profile = Path(__file__).resolve().parents[1] / "host" / "apparmor" / "silo-runtime"
+        text = profile.read_text()
+        self.assertIn(f"profile {probes.SILO_APPARMOR} ", text)
+        self.assertIn(f"deny {probes.APPARMOR_CANARY} w,", text)
+        rules = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+        self.assertIn("network unix,", rules)
+        for forbidden in ("capability", "mount", "ptrace", "network inet", "network,", "userns", "change_profile"):
+            self.assertFalse(any(r == forbidden + "," or r.startswith(forbidden + " ") for r in rules), forbidden)
+
+
 if __name__ == "__main__":
     unittest.main()

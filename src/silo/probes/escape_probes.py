@@ -679,6 +679,34 @@ def probe_exec_lock():
     record("proc.exec_locked", "FAIL", f"execve of {target}: {outcome}. Nothing stops a program in the image from being started")
 
 
+def lsm_verdict(label, canary):
+    """(status, detail) for an LSM label. `canary()` tries the write only silo's AppArmor profile forbids."""
+    if not label or label == "unconfined":
+        return "WARN", "not confined by SELinux or AppArmor"
+    if label.endswith(")") and " (" in label:  # AppArmor: "<profile> (<mode>)", or a stack "<a>//&<b> (<mode>)"
+        profile, _, mode = label[:-1].rpartition(" (")
+        if SILO_APPARMOR in profile.split("//&"):
+            # With no_new_privs AppArmor stacks silo's profile on the label the container runtime had,
+            # and a stack's mode does not say whether silo's part is enforced or only attached. So try
+            # the one thing nothing but that profile forbids.
+            err = canary()
+            if err is not None and err.errno == errno.EACCES:
+                return "PASS", f"confined by AppArmor as {profile}: the profile refused the write that only it forbids"
+            if err is None:
+                return "WARN", (f"AppArmor profile {SILO_APPARMOR} is attached ({label}) but not enforced: a write "
+                                "it denies went through")
+            return "WARN", f"AppArmor label {label}; could not tell whether it is enforced ({err.strerror})"
+        if mode == "enforce":
+            return "PASS", f"confined by AppArmor profile {profile}"
+        return "WARN", f"not confined: AppArmor profile '{profile}' is in {mode} mode"
+    fields = label.split(":")
+    if len(fields) >= 3:  # SELinux: user:role:type[:level[:categories]]
+        if fields[2].startswith("container_") and fields[2] != "container_runtime_t":
+            return "PASS", f"confined by SELinux as {label}"
+        return "WARN", f"not confined as a container: SELinux type {fields[2]} ({label})"
+    return "WARN", f"unrecognised LSM label {label}"
+
+
 def probe_lsm():
     """Is the process confined by a mandatory access control policy (SELinux or AppArmor)?"""
     if GVISOR:
@@ -689,20 +717,12 @@ def probe_lsm():
             label = fh.read().strip("\0\n ")
     except OSError:
         return record("proc.lsm", "WARN", "no LSM label readable: not confined by SELinux or AppArmor")
-    if not label or label == "unconfined":
-        return record("proc.lsm", "WARN", "not confined by SELinux or AppArmor")
-    if label.endswith(")") and " (" in label:  # AppArmor: "<profile> (<mode>)"
-        profile, _, mode = label[:-1].rpartition(" (")
-        if mode == "enforce":
-            return record("proc.lsm", "PASS", f"confined by AppArmor profile {profile}")
-        return record("proc.lsm", "WARN", f"not confined: AppArmor profile '{profile}' is in {mode} mode")
-    fields = label.split(":")
-    if len(fields) >= 3:  # SELinux: user:role:type[:level[:categories]]
-        if fields[2].startswith("container_") and fields[2] != "container_runtime_t":
-            return record("proc.lsm", "PASS", f"confined by SELinux as {label}")
-        return record("proc.lsm", "WARN", f"not confined as a container: SELinux type {fields[2]} ({label})")
-    record("proc.lsm", "WARN", f"unrecognised LSM label {label}")
+    record("proc.lsm", *lsm_verdict(label, lambda: try_write(APPARMOR_CANARY)))
 
+
+# silo's AppArmor profile (host/apparmor/silo-runtime) and the one write nothing but it forbids.
+SILO_APPARMOR = "silo-runtime"
+APPARMOR_CANARY = "/tmp/.silo-apparmor-canary"
 
 SENSITIVE_ENV = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "PROXY", "SSH_AUTH_SOCK", "DBUS", "DISPLAY",
                  "WAYLAND", "XDG_RUNTIME_DIR", "AWS_", "HF_", "LLAMA_ARG_")

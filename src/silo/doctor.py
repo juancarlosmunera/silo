@@ -20,6 +20,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from silo import apparmor
 from silo.config import Config
 
 OK, WARN, BAD = "ok", "warn", "bad"
@@ -189,6 +190,12 @@ def run_checks(cfg: Config, sealed: bool | None = None) -> list[Check]:
     elif cfg.runtime.runsc is not None:
         add(Check("LSM", WARN, "no SELinux/AppArmor confinement; under gVisor the user-space kernel is the "
                   "confinement layer"))
+    elif apparmor.enabled() and apparmor.profile_loaded():
+        add(Check("AppArmor", OK, f"sandbox confined by the profile {apparmor.PROFILE}, which silo sets through "
+                  "the container runtime (rootless Podman applies none itself)"))
+    elif apparmor.enabled():
+        add(Check("AppArmor", BAD, f"enabled on this host, but silo's profile {apparmor.PROFILE} is not loaded: "
+                  "the sandbox runs without mandatory access control", apparmor.INSTALL_HINT))
     else:
         add(Check("LSM", BAD, "no SELinux/AppArmor confinement"))
 

@@ -284,19 +284,32 @@ ruleset is the best available, and it stops everything short of root.
 ## Other distributions
 
 **Ubuntu 24.04** (kernel 6.8, Podman 4.9, installed with `apt-get install podman`): silo runs, the
-service and the tunnel work, the kernel settings and both firewall rulesets load, and 65 of the 66
-escape probes of silo 0.1 pass. The one that does not is confinement by a mandatory access control policy.
-Rootless Podman gets none on Ubuntu: Podman reports AppArmor as not enabled for rootless
-containers and refuses an explicit profile, so the sandbox process runs unconfined by any LSM.
-`silo doctor` fails the host on that line, and `silo probe` reports
+service and the tunnel work, and the kernel settings and both firewall rulesets load.
+
+One more step is needed there. Rootless Podman gets no mandatory access control on Ubuntu: it
+reports AppArmor as not enabled for rootless containers and refuses an explicit profile, so
+without help the sandbox process runs unconfined by any LSM, and `silo probe` says
 
 ```
  WARN proc.lsm                       not confined: AppArmor profile 'crun' is in unconfined mode
 ```
 
-Network isolation, the syscall filter, the privilege drop and the read-only filesystem are all in
-place there. What is missing is the layer that limits what a process can touch after it has found
-a way around the others. If you have the choice, use Fedora.
+Load silo's AppArmor profile as root, once, and silo puts its sandboxes under it by itself
+([host/README.md](../host/README.md#3-apparmor-on-hosts-without-selinux)):
+
+```sh
+sudo install -m 0644 host/apparmor/silo-runtime /etc/apparmor.d/silo-runtime
+sudo apparmor_parser -r /etc/apparmor.d/silo-runtime
+```
+
+```
+ PASS proc.lsm                       confined by AppArmor as crun//&silo-runtime: the profile refused the write that only it forbids
+```
+
+`silo doctor` fails the host until that is done. With it, the escape probes and a model in a silo
+pass in CI on Ubuntu 24.04 for every change, on x86_64 and aarch64. SELinux on Fedora still does
+more: it also gives every container categories of its own, so two sandboxes cannot touch each
+other's files even if both get out.
 
 Debian and the RHEL family have not been tested. On any distribution, `silo doctor` and
 `silo probe` tell you what you actually have.

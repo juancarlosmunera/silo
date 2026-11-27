@@ -1,0 +1,56 @@
+# AppArmor profile for silo's sandbox, for hosts without SELinux (Ubuntu, Debian).
+#
+# Rootless Podman applies no AppArmor profile, and refuses one that is named explicitly. silo
+# therefore sets this profile on its own containers itself, through the container runtime, once
+# root has loaded it:
+#
+#   sudo install -m 0644 host/apparmor/silo-runtime /etc/apparmor.d/silo-runtime
+#   sudo apparmor_parser -r /etc/apparmor.d/silo-runtime
+#
+# `silo doctor` says whether it is loaded and in use, and `silo probe` checks that it is enforced
+# (proc.lsm). The other layers already keep the sandbox from the network, from writing anywhere but
+# its scratch space and from every capability. This profile says the same things again in a
+# mechanism of its own, so that getting past one of those layers is not enough.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile silo-runtime flags=(attach_disconnected,mediate_deleted) {
+  # --- files
+  # The image and the model directory are read; code is mapped and run from them, under this profile.
+  / r,
+  /** rmix,
+
+  # The scratch tmpfs is the one place that can be written, and nothing in it may be mapped
+  # executable or run.
+  /tmp/ r,
+  owner /tmp/** rwk,
+  deny /tmp/** mx,
+  # silo's probes try to create this file: a refusal shows the profile is enforced, not just attached.
+  deny /tmp/.silo-apparmor-canary w,
+
+  /dev/null rw,
+  /dev/zero rw,
+  /dev/full rw,
+  /dev/tty rw,
+  # GPU sandboxes (runtime.gpu): the render nodes silo passes through.
+  /dev/dri/renderD* rw,
+  /dev/kfd rw,
+  /dev/nvidia* rw,
+
+  # Thread names. Everything else under /proc and /sys is read-only.
+  owner /proc/@{pid}/task/@{tid}/comm rw,
+  deny /proc/sys/** w,
+  deny /proc/sysrq-trigger w,
+  deny /sys/** w,
+
+  # --- network: UNIX sockets only, as the seccomp profile already says
+  network unix,
+  unix,
+
+  # --- signals within the sandbox, and from the container runtime that stops it
+  signal,
+
+  # No `capability`, `mount`, `pivot_root`, `ptrace`, `change_profile` or `userns` rule: all denied.
+}

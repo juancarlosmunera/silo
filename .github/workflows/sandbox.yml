@@ -1,10 +1,10 @@
 name: sandbox
 
 # Runs the escape probes and a real model inside a silo, on x86_64 and aarch64 GitHub runners:
-# once on the host kernel (connector, exec lock, argument allowlists) and once on gVisor (its systrap
-# platform on both, its KVM platform on x86_64, where the runners have nested virtualisation).
-# GitHub's Ubuntu runners give rootless Podman no SELinux or AppArmor confinement, so `proc.lsm`
-# is the one probe allowed to fail here (see docs/VPS.md, "Other distributions").
+# once on the host kernel (connector, exec lock, argument allowlists, AppArmor) and once on gVisor
+# (its systrap platform on both, its KVM platform on x86_64, where the runners have nested
+# virtualisation). These are Ubuntu machines, so the mandatory access control tested here is
+# AppArmor, through the profile in host/apparmor. SELinux is not covered.
 
 on:
   push:
@@ -52,6 +52,15 @@ jobs:
           podman pull -q "$PROBE_IMAGE"
           podman pull -q "$RUNTIME_IMAGE"
 
+      # What root does once on an AppArmor host (host/README.md). Without it rootless Podman's
+      # containers run under no mandatory access control at all.
+      - name: AppArmor profile
+        run: |
+          cat /sys/module/apparmor/parameters/enabled
+          sudo install -m 0644 host/apparmor/silo-runtime /etc/apparmor.d/silo-runtime
+          sudo apparmor_parser -r /etc/apparmor.d/silo-runtime
+          sudo aa-status 2>/dev/null | grep silo-runtime
+
       - name: Model
         run: |
           mkdir -p "$RUNNER_TEMP/models/smollm2"
@@ -79,14 +88,14 @@ jobs:
       - name: Escape probes (errno)
         run: |
           bin/silo --config "$RUNNER_TEMP/silo-errno.toml" probe --json > "$RUNNER_TEMP/errno.json" || true
-          python3 .github/scripts/probe_gate.py "$RUNNER_TEMP/errno.json" errno \
-            --allow "proc.lsm=no MAC for rootless Podman on Ubuntu"
+          python3 .github/scripts/probe_gate.py "$RUNNER_TEMP/errno.json" errno
+          grep -q '"confined by AppArmor as' "$RUNNER_TEMP/errno.json"
 
       - name: Escape probes (kill)
         run: |
           bin/silo --config "$RUNNER_TEMP/silo-kill.toml" probe --json > "$RUNNER_TEMP/kill.json" || true
-          python3 .github/scripts/probe_gate.py "$RUNNER_TEMP/kill.json" kill \
-            --allow "proc.lsm=no MAC for rootless Podman on Ubuntu"
+          python3 .github/scripts/probe_gate.py "$RUNNER_TEMP/kill.json" kill
+          grep -q '"confined by AppArmor as' "$RUNNER_TEMP/kill.json"
 
       - name: Baseline (stock container, for comparison)
         run: |
@@ -106,13 +115,32 @@ jobs:
           curl -sfN http://127.0.0.1:8088/v1/chat/completions -H 'Content-Type: application/json' \
             -d '{"messages":[{"role":"user","content":"Count to three"}],"max_tokens":16,"stream":true}' | tail -n 2
           bin/silo --config "$cfg" status
+          bin/silo --config "$cfg" status | grep -q '"apparmor_profile": "silo-runtime"'
           test "$(podman container inspect --format '{{.State.Running}}' silo-ci-kill)" = true
+          # the runtime itself, not just the probes, runs under the profile
+          sudo cat "/proc/$(podman container inspect --format '{{.State.Pid}}' silo-ci-kill)/attr/current"
+          sudo cat "/proc/$(podman container inspect --format '{{.State.Pid}}' silo-ci-kill)/attr/current" | grep -q silo-runtime
+
+      # Everything the profile refused and logged during this job. The probes provoke a few refusals on
+      # purpose (a file under /proc, a look at the POSIX message queues); explicit deny rules, such as
+      # the canary's, are not logged. A refusal by anything but the probes means the profile is in the
+      # runtime's way.
+      - name: What AppArmor denied
+        if: always()
+        run: |
+          sudo dmesg 2>/dev/null | grep 'apparmor="DENIED"' | grep 'silo-runtime' > "$RUNNER_TEMP/denied.txt" || true
+          sed -E 's/.*operation="([^"]*)".*name="([^"]*)".*comm="([^"]*)".*/\1 \2 (\3)/' "$RUNNER_TEMP/denied.txt" | sort | uniq -c
+          unexpected=$(grep -vc 'comm="python3"' "$RUNNER_TEMP/denied.txt" || true)
+          echo "denials by anything but the probes: $unexpected"
+          test "$unexpected" = 0
 
       - name: Logs on failure
         if: failure()
         run: |
           cat "$RUNNER_TEMP/gateway.log" 2>/dev/null || true
           podman logs --tail 50 silo-ci-kill 2>/dev/null || true
+          grep -hE '"(FAIL|WARN)"' "$RUNNER_TEMP"/errno.json "$RUNNER_TEMP"/kill.json 2>/dev/null | head -20 || true
+          sudo dmesg 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -40 || true
 
       - name: Clean up
         if: always()

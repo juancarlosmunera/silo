@@ -26,10 +26,12 @@ inside the sandbox, so a bad image is contained the same way a bad model is.
 
 What has to be correct for the above to hold:
 
-- the host kernel (namespaces, seccomp, cgroups, SELinux enforcement);
-- Podman, crun and conmon, and the SELinux container policy;
-- silo's launcher, connector, exec supervisor and gateway: about 2,100 lines of Python (`sandbox.py`,
-  `seccomp.py`, `runtime.py`, `connector.py`, `execlock.py`, `gateway.py`), standard library only;
+- the host kernel (namespaces, seccomp, cgroups, SELinux or AppArmor enforcement);
+- Podman, crun and conmon, and the SELinux container policy or, on hosts without SELinux, silo's
+  AppArmor profile (`host/apparmor/silo-runtime`);
+- silo's launcher, connector, exec supervisor and gateway: about 2,500 lines of Python (`sandbox.py`,
+  `seccomp.py`, `runtime.py`, `connector.py`, `execlock.py`, `apparmor.py`, `gateway.py`), standard
+  library only;
 - the base seccomp profile shipped by the distribution, which silo tightens but does not replace;
 - with `runtime.runsc`: gVisor (`runsc`, its sentry and its gofer), which then stands where the host
   kernel's system call interface stood, and without SELinux around it;
@@ -100,6 +102,18 @@ that owns nothing on the host. All capabilities are dropped, the bounding set is
 `no-new-privileges` is set, and SELinux confines the process as `container_t` with categories
 unique to the container. Verified by `proc.uid`, `proc.capabilities`, `proc.no_new_privs`,
 `proc.seccomp`, `proc.lsm`.
+
+On hosts without SELinux the mandatory access control layer is AppArmor, and it takes a step as
+root. Rootless Podman applies no AppArmor profile and refuses an explicit one, so silo sets its own
+(`host/apparmor/silo-runtime`) through the container runtime: once root has loaded the profile,
+silo starts Podman with a wrapper as the OCI runtime, which writes the profile's name into the
+container's configuration and then becomes the real runtime (`silo/apparmor.py`). Changing into a
+loaded profile takes no privilege, and the wrapper refuses to start a container it could not
+label. The profile allows reading the image and the model, writing to the scratch space and
+executing nothing from it, UNIX sockets and no other network, and no capability, mount or ptrace.
+Because `no-new-privileges` is set, AppArmor stacks it on the label the runtime already had
+(`crun//&silo-runtime`); every profile of a stack has to allow an operation. `proc.lsm` does not
+take the label's word for it: it attempts the one write that nothing but the profile forbids.
 
 ### Filesystem and persistence
 
@@ -263,10 +277,11 @@ Stated plainly, in rough order of importance.
 7. **Information visible inside.** Kernel version, CPU details, memory size and the host path of
    the model directory (through the mount table) are readable in the sandbox.
 8. **Denial of service.** The sandbox can use all the CPU it is given and all of its memory cap.
-9. **Hosts without SELinux.** On Ubuntu, rootless Podman applies no SELinux or AppArmor policy, so
-   the sandbox process is not confined by any mandatory access control. Everything else is in
-   place there, but the layer that limits what a process can touch once it is past the others is
-   missing. `silo doctor` fails such a host and `silo probe` reports it.
+9. **Hosts without SELinux.** On Ubuntu and Debian, rootless Podman applies no SELinux or AppArmor
+   policy by itself. Until root has loaded silo's AppArmor profile, the sandbox process is not
+   confined by any mandatory access control: `silo doctor` fails such a host and `silo probe`
+   reports it. With the profile loaded that layer is there, but it is coarser than SELinux's: one
+   profile for every sandbox, where SELinux gives each container categories of its own.
 10. **Streaming in monitor mode.** Findings in a live stream are logged after the text has been
     delivered. Only `enforce` withholds.
 11. **gVisor sandboxes.** They exchange one layer for another. SELinux does not confine them and
@@ -284,5 +299,4 @@ Stated plainly, in rough order of importance.
 
 ## Roadmap
 
-- Mandatory access control for the sandbox on AppArmor hosts.
 - Verification on NVIDIA and AMD GPUs.

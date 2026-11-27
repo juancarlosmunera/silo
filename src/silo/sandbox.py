@@ -159,13 +159,14 @@ def podman_run_args(
     gpu: str = "none",
     umask: str = "0022",
     remove: bool = True,
+    oci_runtime: Path | None = None,
 ) -> list[str]:
     rt = cfg.runtime
     memory = memory or rt.memory
     gvisor = rt.runsc is not None
     args = [
         "podman",
-        *gvisor_globals(rt),
+        *runtime_globals(rt, oci_runtime),
         "run",
         *(["--rm"] if remove else []),
         f"--name={name}",
@@ -222,8 +223,16 @@ def podman_run_args(
         args.append("--interactive")
     args.append(image)
     args.extend(command)
-    assert_hardened(args, gpu=gpu, gvisor=gvisor_globals(rt))
+    assert_hardened(args, gpu=gpu, gvisor=gvisor_globals(rt), oci_runtime=oci_runtime)
     return args
+
+
+def runtime_globals(rt, oci_runtime: Path | None = None) -> list[str]:
+    """Global podman flags that choose the OCI runtime: gVisor, or silo's AppArmor wrapper around the
+    default one (silo.apparmor). gVisor takes precedence; host LSM profiles do not reach inside it."""
+    if rt.runsc is not None:
+        return gvisor_globals(rt)
+    return [f"--runtime={oci_runtime}"] if oci_runtime is not None else []
 
 
 def gvisor_scope(memory_bytes: int, tasks: int, cpus: float | None = None) -> list[str]:
@@ -240,12 +249,18 @@ def gvisor_scope(memory_bytes: int, tasks: int, cpus: float | None = None) -> li
     return scope
 
 
-def assert_hardened(args: list[str], gpu: str = "none", gvisor: list[str] = ()) -> None:
-    """Check a podman command line before it runs. `gvisor` is gvisor_globals() for the sandbox."""
+def assert_hardened(args: list[str], gpu: str = "none", gvisor: list[str] = (),
+                    oci_runtime: Path | None = None) -> None:
+    """Check a podman command line before it runs.
+
+    `gvisor` is gvisor_globals() for the sandbox, and `oci_runtime` silo's AppArmor wrapper if one
+    is in use: the only global flags a silo command line may carry.
+    """
     if args[:1] != ["podman"] or "run" not in args:
         raise HardeningError("not a podman run command")
     run_idx = args.index("run")
-    if args[1:run_idx] != list(gvisor):
+    expected = list(gvisor) or ([f"--runtime={oci_runtime}"] if oci_runtime is not None else [])
+    if args[1:run_idx] != expected:
         raise HardeningError(f"unexpected global podman flags: {args[1:run_idx]}")
     try:
         image_idx = next(i for i, a in enumerate(args) if i > run_idx and not a.startswith("-"))

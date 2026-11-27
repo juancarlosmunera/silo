@@ -279,6 +279,34 @@ class RunDirTests(unittest.TestCase):
         self.assertFalse(any(line.startswith(("from silo", "import silo")) for line in script.splitlines()))  # runs from source under `podman unshare`, outside the package
 
 
+class AppArmorRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_wrapper_only_when_the_profile_is_loaded(self):
+        with mock.patch.object(runtime.apparmor, "profile_loaded", return_value=False):
+            self.assertIsNone(runtime.apparmor_runtime(cfg_with()))
+        with mock.patch.object(runtime.apparmor, "profile_loaded", return_value=True), \
+                mock.patch.object(runtime, "oci_runtime_path", return_value="/usr/bin/crun"):
+            wrapper = runtime.apparmor_runtime(cfg_with())
+            self.assertEqual(wrapper, Path(self.tmp.name) / "silo" / "oci" / "silo-oci-runtime")
+            self.assertIn("'/usr/bin/crun'", wrapper.read_text())
+            self.assertIsNone(runtime.apparmor_runtime(gvisor_cfg()))   # never on gVisor
+
+    def test_default_runtime_must_be_a_real_program(self):
+        for stdout, code in (("", 0), ("crun\n", 0), ("/nonexistent/crun\n", 0), ("/usr/bin/true\n", 1)):
+            with self.subTest(stdout=stdout, code=code), \
+                    mock.patch.object(runtime, "run", return_value=mock.Mock(stdout=stdout, stderr="", returncode=code)), \
+                    self.assertRaises(runtime.LaunchError):
+                runtime.oci_runtime_path()
+        with mock.patch.object(runtime, "run", return_value=mock.Mock(stdout="/usr/bin/true\n", stderr="", returncode=0)):
+            self.assertEqual(runtime.oci_runtime_path(), "/usr/bin/true")
+
+
 class ExecLockTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

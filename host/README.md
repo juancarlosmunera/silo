@@ -1,7 +1,7 @@
 # Host-side hardening
 
 Everything silo does on its own runs as your user, with no root and no changes outside its own
-state directories. The two pieces here are different: they need root, they are host-wide, and they
+state directories. The pieces here are different: they need root, they are host-wide, and they
 are optional. They are the layers that still stand if something gets out of the container.
 
 Both were applied and exercised as root on Fedora 43 and Ubuntu 24.04 test machines; the results
@@ -83,13 +83,46 @@ sudo install -m 0644 host/sysctl/90-silo-hardening.conf /etc/sysctl.d/
 sudo sysctl --system
 ```
 
-## 3. Things only you can do
+## 3. AppArmor, on hosts without SELinux
+
+On Ubuntu and Debian, rootless Podman puts its containers under no mandatory access control: it
+does not apply an AppArmor profile and refuses one that is named explicitly. silo can set one
+itself, through the container runtime, but only a profile that is already loaded, and loading one
+takes root:
+
+```sh
+sudo install -m 0644 host/apparmor/silo-runtime /etc/apparmor.d/silo-runtime
+sudo apparmor_parser -r /etc/apparmor.d/silo-runtime
+```
+
+Nothing else has to be configured. From then on silo starts its sandboxes under that profile, and
+
+```sh
+silo doctor    # "AppArmor: sandbox confined by the profile silo-runtime"
+silo probe     # "proc.lsm: confined by AppArmor as crun//&silo-runtime: the profile refused the write that only it forbids"
+```
+
+The profile repeats, in a mechanism of its own, what the other layers already say: read the image
+and the model, write only to the scratch space and execute nothing from it, UNIX sockets and no
+other network, no capability, no mount, no ptrace. It only applies to containers silo starts.
+`silo doctor` fails the host as long as AppArmor is enabled and the profile is not loaded.
+
+The label has two parts because silo sets `no-new-privileges`: AppArmor then adds silo's profile to
+the one the container runtime already had (Ubuntu's `crun` profile, which confines nothing)
+instead of replacing it, and every profile in such a stack has to allow an operation.
+
+Tested in CI on Ubuntu 24.04 (Podman 4.9, crun 1.14), x86_64 and aarch64: the probes in both
+seccomp modes and a model in a silo, with a check that the profile refused nothing the runtime
+did. What it does refuse there are the probes' own attempts. Not tested: GPU sandboxes under the profile, Debian, and SELinux hosts, where
+silo does not use it.
+
+## 4. Things only you can do
 
 - Keep the kernel patched. The sandbox shares the host kernel; that is its main residual risk.
   To put a second boundary around it, run silo in a VM with no network device
   ([docs/LOCAL_VM.md](../docs/LOCAL_VM.md)), on a dedicated, sealed server
   ([docs/VPS.md](../docs/VPS.md)), or on gVisor's user-space kernel
   ([docs/GVISOR.md](../docs/GVISOR.md)).
-- Keep SELinux enforcing. `silo doctor` fails the check if it is not.
+- Keep SELinux enforcing where the host has it. `silo doctor` fails the check if it is not.
 - Leave the user Podman API socket off (`systemctl --user disable --now podman.socket`) unless you
   need it: anything that can reach it controls every container you own.

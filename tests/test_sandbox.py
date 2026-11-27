@@ -89,6 +89,26 @@ class SandboxArgsTests(unittest.TestCase):
                 sandbox.assert_hardened(args[:args.index("run") + 1] + [bad] + args[args.index("run") + 1:],
                                         gvisor=gvisor)
 
+    def test_apparmor_runtime_wrapper(self):
+        wrapper = Path("/home/u/.local/state/silo/oci/silo-oci-runtime")
+        args = build(oci_runtime=wrapper)
+        self.assertEqual(args[:3], ["podman", f"--runtime={wrapper}", "run"])
+        for flag in sandbox.REQUIRED_FLAGS:
+            self.assertIn(flag, args)
+        self.assertNotIn("--security-opt=label=disable", args)       # that exception is gVisor's alone
+        sandbox.assert_hardened(args, oci_runtime=wrapper)
+        with self.assertRaises(sandbox.HardeningError):             # a runtime nobody asked for
+            sandbox.assert_hardened(args)
+        with self.assertRaises(sandbox.HardeningError):             # or a different one
+            sandbox.assert_hardened(args, oci_runtime=Path("/tmp/other"))
+        with self.assertRaises(sandbox.HardeningError):
+            sandbox.assert_hardened(["podman", f"--runtime={wrapper}", "--root=/tmp/x", *args[2:]], oci_runtime=wrapper)
+        # gVisor takes precedence: a host profile does not reach inside it
+        gv = sandbox.podman_run_args(self.gvisor_cfg(), name="silo-t", image="img:1", command=["--x"],
+                                     seccomp_profile=Path("/tmp/p.json"), oci_runtime=wrapper)
+        self.assertNotIn(f"--runtime={wrapper}", gv)
+        self.assertIn("--runtime=/usr/local/bin/runsc", gv)
+
     def test_gvisor_scope(self):
         scope = sandbox.gvisor_scope(2 << 30, 1024)
         self.assertEqual(scope[:3], ["systemd-run", "--user", "--scope"])

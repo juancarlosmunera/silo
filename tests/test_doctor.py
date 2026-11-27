@@ -167,7 +167,7 @@ class RunChecksTests(unittest.TestCase):
                        "cgroupVersion": "v2", "cgroupControllers": ["cpu", "memory", "pids"]}}
 
     def run_checks(self, virt, sealed, systemctl_missing=False, cfg=None, tools=("podman",), runsc_version=None,
-                   podman=None):
+                   podman=None, apparmor=(False, False)):
         def fake_run(cmd, *args, **kwargs):
             if cmd[0] == "systemctl" and systemctl_missing:
                 raise FileNotFoundError("systemctl")
@@ -179,6 +179,8 @@ class RunChecksTests(unittest.TestCase):
                 mock.patch.object(doctor, "_virtualization", return_value=virt), \
                 mock.patch.object(doctor, "_linger", return_value=None), \
                 mock.patch.object(doctor, "_runsc_version", return_value=runsc_version), \
+                mock.patch.object(doctor.apparmor, "enabled", return_value=apparmor[0]), \
+                mock.patch.object(doctor.apparmor, "profile_loaded", return_value=apparmor[1]), \
                 mock.patch.object(doctor.subprocess, "run", side_effect=fake_run):
             return {c.name: c for c in doctor.run_checks(cfg or Config(), sealed=sealed)}
 
@@ -220,6 +222,24 @@ class RunChecksTests(unittest.TestCase):
                                       runsc_version="release-1", podman=podman)
         self.assertEqual(with_gvisor["LSM"].level, doctor.WARN)
         self.assertEqual(self.run_checks(None, None, podman=podman)["LSM"].level, doctor.BAD)
+
+    def test_apparmor_hosts(self):
+        podman = {"host": {**self.PODMAN["host"], "security": {"rootless": True}}}  # no SELinux, as on Ubuntu
+        confined = self.run_checks(None, None, podman=podman, apparmor=(True, True))
+        self.assertEqual(confined["AppArmor"].level, doctor.OK)
+        self.assertIn("silo-runtime", confined["AppArmor"].detail)
+        self.assertNotIn("LSM", confined)
+        unloaded = self.run_checks(None, None, podman=podman, apparmor=(True, False))
+        self.assertEqual(unloaded["AppArmor"].level, doctor.BAD)
+        self.assertIn("apparmor_parser -r", unloaded["AppArmor"].fix)
+        self.assertEqual(self.run_checks(None, None, podman=podman)["LSM"].level, doctor.BAD)  # no LSM at all
+        # SELinux hosts are judged by SELinux, whatever AppArmor says
+        self.assertNotIn("AppArmor", self.run_checks(None, None, apparmor=(True, True)))
+        # and on gVisor a host profile does not reach the workload
+        gvisor = self.run_checks(None, None, cfg=self.gvisor_cfg(), tools=("podman", "systemd-run"),
+                                 runsc_version="release-1", podman=podman, apparmor=(True, True))
+        self.assertNotIn("AppArmor", gvisor)
+        self.assertEqual(gvisor["LSM"].level, doctor.WARN)
 
     def test_exec_lock(self):
         from silo.config import Config
